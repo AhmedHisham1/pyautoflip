@@ -100,6 +100,8 @@ class AutoFlipProcessor:
         """
         Process a video file and generate a reframed version.
         
+        Uses a streaming approach to avoid loading all frames in memory at once.
+        
         Args:
             input_path: Path to the input video file
             output_path: Path to save the output video
@@ -177,76 +179,87 @@ class AutoFlipProcessor:
             duration=video_reader.frame_count / video_reader.fps
         )
         
-        # Make sure we're starting at the beginning of the video
-        video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
         total_detection_time = 0
         total_cropping_time = 0
         total_frames_processed = 0
-        frame_count = 0
         
         # Process each scene sequentially
         for scene_idx, (start_frame, end_frame) in enumerate(scene_boundaries):
             scene_length = end_frame - start_frame
             logger.info(f"Processing scene {scene_idx+1}/{len(scene_boundaries)} with {scene_length} frames...")
             
-            # Skip to the correct starting frame position
-            if frame_count < start_frame:
-                frames_to_skip = start_frame - frame_count
-                logger.info(f"Skipping {frames_to_skip} frames to reach scene start")
-                
-                for _ in range(frames_to_skip):
-                    ret = video_reader.cap.grab()  # Just grab the frame without decoding it (faster)
-                    if not ret:
-                        logger.warning(f"Could not skip to frame {start_frame}, video ended prematurely")
-                        break
-                    frame_count += 1
-            
-            # Read all frames in this scene
-            scene_frames = []
-            scene_frame_count = 0
-            
-            while frame_count < end_frame:
-                ret, frame = video_reader.cap.read()
-                if not ret:
-                    logger.warning(f"Reached end of video at frame {frame_count}, expected end at {end_frame}")
-                    break
-                
-                scene_frames.append(frame)
-                frame_count += 1
-                scene_frame_count += 1
-            
-            if not scene_frames:
-                logger.warning(f"No frames read for scene {scene_idx+1}, skipping")
-                continue
-            
-            # Step 3.1: Detect faces and objects in key frames
+            # PASS 1: Sample key frames and detect content
             detection_start_time = time.time()
-            key_frame_indices = self._select_key_frames(scene_frames)
             
+            # Select key frame indices (sparse sampling)
+            frame_count = scene_length
+            num_samples = min(8, max(3, frame_count // 60 + 3)) if frame_count > 10 else 3
+            relative_key_indices = sorted([int(i) for i in np.linspace(0, frame_count - 1, num_samples)])
+            # Convert to absolute frame indices
+            key_frame_indices = [idx + start_frame for idx in relative_key_indices]
+            
+            logger.info(f"Selected {len(key_frame_indices)} key frames for content detection")
+            
+            # Read only the key frames
+            key_frames = {}
             face_detections = {}
             object_detections = {}
             
-            # Using tqdm to show progress of detection
-            for idx in tqdm(key_frame_indices, desc="Detecting content"):
-                frame = self._downsample_frame(scene_frames[idx])
+            # Go to the beginning of the scene
+            video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            
+            # Read and process key frames only
+            current_frame_idx = start_frame
+            
+            for key_idx in tqdm(key_frame_indices, desc="Detecting content"):
+                # Skip frames if needed to reach the next key frame
+                frames_to_skip = key_idx - current_frame_idx
+                
+                if frames_to_skip > 0:
+                    for _ in range(frames_to_skip):
+                        ret = video_reader.cap.grab()  # Just grab frames without decoding
+                        if not ret:
+                            logger.warning(f"Could not skip to frame {key_idx}, video ended prematurely")
+                            break
+                        current_frame_idx += 1
+                
+                # Read the key frame
+                ret, frame = video_reader.cap.read()
+                if not ret:
+                    logger.warning(f"Failed to read frame at position {key_idx}")
+                    continue
+                
+                current_frame_idx += 1
+                
+                # Store the key frame
+                key_frames[key_idx - start_frame] = frame
+                
+                # Downsample frame for detection
+                downsampled_frame = self._downsample_frame(frame)
+                
+                # Detect faces
                 try:
-                    face_detections[idx] = self.face_detector.detect(frame)
+                    faces = self.face_detector.detect(downsampled_frame)
+                    face_detections[key_idx - start_frame] = faces
                 except Exception as e:
-                    logger.error(f"Face detection failed for frame {idx}: {e}")
-                    face_detections[idx] = []
-                    
+                    logger.error(f"Face detection failed for frame {key_idx}: {e}")
+                    face_detections[key_idx - start_frame] = []
+                
+                # Detect objects
                 try:
-                    object_detections[idx] = self.object_detector.detect(frame)
+                    objects = self.object_detector.detect(downsampled_frame)
+                    object_detections[key_idx - start_frame] = objects
                 except Exception as e:
-                    logger.error(f"Object detection failed for frame {idx}: {e}")
-                    object_detections[idx] = []
+                    logger.error(f"Object detection failed for frame {key_idx}: {e}")
+                    object_detections[key_idx - start_frame] = []
             
             detection_time = time.time() - detection_start_time
             total_detection_time += detection_time
             
-            # Step 3.2: Create scene cropper
+            # PASS 2: Setup cropping strategy using key frames
             cropping_start_time = time.time()
+            
+            # Create scene cropper
             cropper = SceneCropper(
                 target_aspect_ratio=self.target_aspect_ratio,
                 motion_threshold=self.motion_threshold,
@@ -254,42 +267,99 @@ class AutoFlipProcessor:
                 debug_mode=self.debug_mode
             )
             
-            # Process scene to establish cropping strategy
+            # Get frame dimensions
+            first_key_frame = next(iter(key_frames.values()))
+            frame_height, frame_width = first_key_frame.shape[:2]
+            frame_dimensions = (frame_height, frame_width)
+            
+            # Process scene in streaming mode (generate crop windows but don't store frames)
             try:
-                cropped_frames, debug_vis_frames = cropper.process_scene(
-                    scene_frames,
+                crop_windows = cropper.process_scene_streaming(
+                    key_frames,
                     face_detections,
                     object_detections,
-                    key_frame_indices
+                    scene_length,
+                    frame_dimensions
                 )
                 
-                # Write frames to output
-                for frame in cropped_frames:
-                    video_writer.write_frame(frame)
-                    total_frames_processed += 1
+                if not crop_windows:
+                    raise ValueError("No crop windows generated")
+                    
+                # PASS 3: Stream through all frames again and apply crop windows
+                
+                # Return to the beginning of the scene
+                video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                
+                # Process frames in small batches to optimize I/O
+                batch_size = 30  # Process 30 frames at a time (adjustable)
+                for batch_start in range(0, scene_length, batch_size):
+                    batch_end = min(batch_start + batch_size, scene_length)
+                    
+                    for i in range(batch_start, batch_end):
+                        # Read frame
+                        ret, frame = video_reader.cap.read()
+                        if not ret:
+                            logger.warning(f"Failed to read frame at position {start_frame + i}")
+                            continue
+                        
+                        # Get crop window for this frame
+                        crop_window = crop_windows[i]
+                        
+                        # Apply crop window
+                        cropped_frame = cropper.apply_crop_window(frame, crop_window)
+                        
+                        # Write to output
+                        video_writer.write_frame(cropped_frame)
+                        total_frames_processed += 1
                 
                 # Process debug visualization if needed
                 if self.debug_mode:
-                    first_key_idx = key_frame_indices[0]
-                    frame_info = f"Scene: {scene_idx+1}/{len(scene_boundaries)}, Frame: {first_key_idx}/{len(scene_frames)}"
+                    # Convert to scene-relative index
+                    first_key_relative_idx = relative_key_indices[0]
+                    first_key_abs_idx = key_frame_indices[0]
                     
-                    # Get detection visualization frame
-                    detection_frame = debug_vis_frames.get(first_key_idx)
+                    frame_info = f"Scene: {scene_idx+1}/{len(scene_boundaries)}, Frame: {first_key_relative_idx}/{scene_length}"
                     
-                    # Get trajectory visualization frame
-                    trajectory_frame = debug_vis_frames.get(-1)  # Special key for trajectory
+                    # Use the first key frame for visualization
+                    sample_frame = key_frames[first_key_relative_idx]
+                    crop_window = crop_windows[first_key_relative_idx]
+                    
+                    # Create visualization of detections
+                    processed_face_dets = face_detections.get(first_key_relative_idx, [])
+                    processed_obj_dets = object_detections.get(first_key_relative_idx, [])
+                    
+                    # Create a debug frame
+                    x, y, crop_width, crop_height = crop_window
+                    debug_frame = VisualizationUtils.create_debug_frame(
+                        frame=sample_frame,
+                        x=x,
+                        y=y,
+                        crop_width=crop_width,
+                        crop_height=crop_height,
+                        face_dets=processed_face_dets,
+                        object_dets=processed_obj_dets,
+                        saliency_score=None,  # We don't have this in streaming mode
+                        camera_mode=cropper.camera_mode if hasattr(cropper, 'camera_mode') else None
+                    )
                     
                     # Get crop window
-                    current_crop_window = cropper.current_crop_window if hasattr(cropper, 'current_crop_window') else None
+                    current_crop_window = crop_window
+                    
+                    # Create trajectory visualization with a few samples
+                    trajectory_samples = crop_windows[::max(1, len(crop_windows) // 10)]
+                    trajectory_frame = VisualizationUtils.create_trajectory_vis(
+                        sample_frame, trajectory_samples, 0)
                     
                     # Debug visualization
                     debug_path = VisualizationUtils.get_standard_debug_path(
-                        self.debug_dir, scene_idx, first_key_idx)
+                        self.debug_dir, scene_idx, first_key_relative_idx)
+                    
+                    cropped_sample = cropper.apply_crop_window(sample_frame, crop_window)
                     
                     VisualizationUtils.display_processing_view(
-                        original_frame=scene_frames[first_key_idx],
-                        detection_frame=detection_frame,
-                        cropped_frame=cropped_frames[first_key_idx] if first_key_idx < len(cropped_frames) else None,
+                        original_frame=sample_frame,
+                        detection_frame=debug_frame,
+                        cropped_frame=cropped_sample,
                         crop_window=current_crop_window,
                         trajectory_frame=trajectory_frame,
                         frame_info=frame_info,
@@ -299,29 +369,47 @@ class AutoFlipProcessor:
             except Exception as e:
                 logger.error(f"Scene cropping failed: {e}. Falling back to center crop.")
                 
-                # Fall back to center crop
-                height, width = scene_frames[0].shape[:2]
-                target_width = int(height * self.target_aspect_ratio)
+                # Return to the beginning of the scene
+                video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
                 
                 # Calculate center crop dimensions
-                if target_width <= width:
+                if not 'frame_width' in locals():
+                    # Read a frame to get dimensions if we don't have them
+                    ret, frame = video_reader.cap.read()
+                    if not ret:
+                        logger.error(f"Could not read frame to determine dimensions, skipping scene {scene_idx+1}")
+                        continue
+                    # Return to beginning of scene again
+                    video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                    frame_height, frame_width = frame.shape[:2]
+                
+                # Calculate center crop based on target aspect ratio
+                target_width = int(frame_height * self.target_aspect_ratio)
+                
+                # Calculate center crop dimensions
+                if target_width <= frame_width:
                     # Need to crop width
-                    x = (width - target_width) // 2
+                    x = (frame_width - target_width) // 2
                     y = 0
                     crop_width = target_width
-                    crop_height = height
+                    crop_height = frame_height
                 else:
                     # Need to crop height
-                    target_height = int(width / self.target_aspect_ratio)
+                    target_height = int(frame_width / self.target_aspect_ratio)
                     x = 0
-                    y = (height - target_height) // 2
-                    crop_width = width
+                    y = (frame_height - target_height) // 2
+                    crop_width = frame_width
                     crop_height = target_height
                 
-                logger.info(f"Using center crop: ({x}, {y}, {crop_width}, {crop_height})")
+                center_crop = (x, y, crop_width, crop_height)
+                logger.info(f"Using center crop: {center_crop}")
                 
                 # Apply center crop to all frames in the scene
-                for frame in scene_frames:
+                for _ in range(scene_length):
+                    ret, frame = video_reader.cap.read()
+                    if not ret:
+                        break
+                    
                     cropped = frame[y:y+crop_height, x:x+crop_width]
                     video_writer.write_frame(cropped)
                     total_frames_processed += 1
@@ -332,7 +420,7 @@ class AutoFlipProcessor:
             logger.info(f"Scene {scene_idx+1} processing summary:")
             logger.info(f"    - Detection time: {detection_time:.2f} seconds")
             logger.info(f"    - Cropping time: {cropping_time:.2f} seconds")
-            logger.info(f"    - Processed {scene_frame_count} frames")
+            logger.info(f"    - Processed {scene_length} frames")
         
         self.timing_info["detection"] = total_detection_time
         self.timing_info["cropping"] = total_cropping_time
@@ -383,7 +471,7 @@ class AutoFlipProcessor:
         
         logger.info(f"Completed processing. Output saved to: {output_path}")
         return output_path
-        
+    
     def _downsample_frame(self, frame: np.ndarray) -> np.ndarray:
         """Downsample a frame for more efficient processing."""
         target_width = 480
@@ -392,18 +480,16 @@ class AutoFlipProcessor:
         new_size = (target_width, int(h * scale))
         return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
     
-    def _select_key_frames(self, scene_frames: List[np.ndarray]) -> List[int]:
+    def _select_key_frames_indices(self, frame_count: int) -> List[int]:
         """
-        Select key frames from a scene for content detection.
+        Select key frame indices from a scene without loading all frames.
         
         Args:
-            scene_frames: List of frames in the scene
+            frame_count: Number of frames in the scene
             
         Returns:
             List of indices for key frames
         """
-        frame_count = len(scene_frames)
-        
         if frame_count < 3:
             return list(range(frame_count))
             
