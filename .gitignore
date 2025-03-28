@@ -1,3 +1,19 @@
+# custom
+log
+*.log
+
+*.mp4
+*.avi
+*.mov
+*.gif
+*.jpg
+*.jpeg
+*.png
+
+/debug*
+
+*.pt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
