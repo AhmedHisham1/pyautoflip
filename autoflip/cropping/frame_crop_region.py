@@ -1,8 +1,5 @@
 import logging
-import math
 from typing import Dict, List, Tuple, Any
-
-from autoflip.cropping.types import CoverageType
 
 logger = logging.getLogger("autoflip.cropping.frame_crop_region")
 
@@ -63,7 +60,9 @@ class FrameCropRegionComputer:
             - crop_region: (x, y, width, height) of resulting crop region
             - crop_score: Score for the crop region
         """
-        required_detections = [d for d in fused_detections if d.get("is_required", False)]
+        required_detections = [
+            d for d in fused_detections if d.get("is_required", False)
+        ]
 
         # Process required detections first
         (
@@ -219,7 +218,6 @@ class FrameCropRegionComputer:
             # edge case: if the crop ends at the bottom edge of the frame, we need to move it up by the difference
             if (y + height) > frame_height:
                 y = frame_height - height
-
 
         # ensure the crop region stays within frame boundaries
         if x < 0:
