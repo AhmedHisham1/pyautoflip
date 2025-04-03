@@ -40,9 +40,6 @@ class SceneCropper:
         target_aspect_ratio: float,
         motion_threshold: float = 0.5,
         padding_method: str = "blur",
-        blur_cv_size: int = 200,
-        overlay_opacity: float = 0.6,
-        background_contrast: float = 0.6,
         debug_mode: bool = False,
     ):
         """
@@ -52,17 +49,11 @@ class SceneCropper:
             target_aspect_ratio: Target aspect ratio as width/height (e.g., 9/16)
             motion_threshold: Threshold for camera motion (0.0-1.0)
             padding_method: Method for padding ("blur" or "solid_color")
-            blur_cv_size: Size of the blur kernel for padding (default: 200, matching MediaPipe)
-            overlay_opacity: Opacity of the darkening overlay (default: 0.6, matching MediaPipe)
-            background_contrast: Contrast adjustment for background (default: 0.6, matching MediaPipe)
             debug_mode: If True, generate debug visualizations
         """
         self.target_aspect_ratio = target_aspect_ratio
         self.motion_threshold = motion_threshold
         self.padding_method = padding_method
-        self.blur_cv_size = blur_cv_size
-        self.overlay_opacity = overlay_opacity
-        self.background_contrast = background_contrast
         self.debug_mode = debug_mode
 
         # Initialize component modules
@@ -77,7 +68,7 @@ class SceneCropper:
 
         logger.debug(
             f"Initialized SceneCropper with target AR: {target_aspect_ratio}, "
-            f"motion threshold: {motion_threshold}, blur size: {blur_cv_size}"
+            f"motion threshold: {motion_threshold}"
         )
 
     def process_scene(
@@ -139,9 +130,10 @@ class SceneCropper:
             )
 
         # Step 4: Select camera motion mode and generate windows
-        camera_mode = self._select_camera_motion_mode(
-            key_crop_regions, key_frame_indices
+        camera_mode = self.camera_motion_handler.select_camera_motion_mode(
+            key_crop_regions
         )
+        logger.debug(f"Selected camera motion mode: {camera_mode.name}")
 
         # Step 5: Generate and smooth crop windows
         all_crop_windows = self._generate_crop_windows(
@@ -383,28 +375,6 @@ class SceneCropper:
 
             Visualizer.report_frame(frame, f"SceneCropper - Frame {frame_idx}")
 
-    def _select_camera_motion_mode(
-        self, key_crop_regions: List[Tuple], key_frame_indices: List[int]
-    ):
-        """Select the appropriate camera motion mode based on crop regions."""
-        camera_mode_start = time.time()
-
-        camera_mode = self.camera_motion_handler.select_camera_motion_mode(
-            key_crop_regions, key_frame_indices
-        )
-
-        logger.debug(f"Selected camera motion mode: {camera_mode.name}")
-
-        # Save the camera mode for later reference
-        self.camera_mode = camera_mode
-
-        camera_mode_end = time.time()
-        logger.debug(
-            f"Camera mode selection took {camera_mode_end - camera_mode_start:.4f} seconds"
-        )
-
-        return camera_mode
-
     def _generate_crop_windows(
         self,
         key_crop_regions: List[Tuple],
@@ -498,12 +468,7 @@ class SceneCropper:
         y = max(0, min(y, frame_height - crop_height))
 
         # Extract crop region - core operation
-        extraction_start = time.time()
         crop_region = frame[y : y + crop_height, x : x + crop_width]
-        extraction_end = time.time()
-        logger.debug(
-            f"Crop region extraction took {extraction_end - extraction_start:.4f} seconds"
-        )
 
         # Check if padding is needed
         crop_aspect_ratio = crop_width / crop_height
@@ -531,9 +496,6 @@ class SceneCropper:
                 target_width=target_width,
                 target_height=target_height,
                 padding_method=self.padding_method,
-                blur_cv_size=self.blur_cv_size,
-                overlay_opacity=self.overlay_opacity,
-                background_contrast=self.background_contrast,
             )
             result = padded_frame
         else:

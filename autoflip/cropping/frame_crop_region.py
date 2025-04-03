@@ -63,10 +63,7 @@ class FrameCropRegionComputer:
             - crop_region: (x, y, width, height) of resulting crop region
             - crop_score: Score for the crop region
         """
-        # Separate required and non-required detections
-        required_detections, non_required_detections = self._separate_detections(
-            fused_detections
-        )
+        required_detections = [d for d in fused_detections if d.get("is_required", False)]
 
         # Process required detections first
         (
@@ -95,21 +92,6 @@ class FrameCropRegionComputer:
         )
 
         return crop_region, crop_region_score
-
-    def _separate_detections(
-        self, fused_detections: List[Dict[str, Any]]
-    ) -> Tuple[List, List]:
-        """Separate detections into required and non-required lists."""
-        required_detections = []
-        non_required_detections = []
-
-        for detection in fused_detections:
-            if detection.get("is_required", False):
-                required_detections.append(detection)
-            else:
-                non_required_detections.append(detection)
-
-        return required_detections, non_required_detections
 
     def _process_required_detections(
         self,
