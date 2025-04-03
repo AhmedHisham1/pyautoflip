@@ -7,10 +7,6 @@ logger = logging.getLogger("autoflip.cropping.frame_crop_region")
 class FrameCropRegionComputer:
     """
     Computes optimal crop regions based on salient detections.
-
-    Similar to MediaPipe's FrameCropRegionComputer, this class determines the
-    best crop window that includes required regions and tries to cover as many
-    non-required regions as possible.
     """
 
     def __init__(
@@ -47,8 +43,6 @@ class FrameCropRegionComputer:
     ) -> Tuple[Tuple[int, int, int, int], float, bool]:
         """
         Compute optimal crop region for a frame based on detections.
-
-        Similar to MediaPipe's ComputeFrameCropRegion.
 
         Args:
             fused_detections: List of fused detections with required/non-required flags

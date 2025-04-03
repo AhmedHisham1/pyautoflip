@@ -18,9 +18,6 @@ logger = logging.getLogger("autoflip.cropping.padding_effects")
 class PaddingEffectGenerator:
     """
     Generates padding effects to maintain target aspect ratio.
-
-    This class handles various padding effects similar to MediaPipe's implementation,
-    including blurred backgrounds and solid color padding.
     """
 
     def __init__(self):
@@ -59,7 +56,7 @@ class PaddingEffectGenerator:
         background_contrast: float = 0.6,
     ) -> np.ndarray:
         """
-        Apply MediaPipe-style padding to fit the target aspect ratio.
+        Apply padding to fit the target aspect ratio.
 
         Args:
             frame: Original frame
