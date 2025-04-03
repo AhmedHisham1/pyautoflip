@@ -479,7 +479,6 @@ class SceneCropper:
         # Only apply padding if absolutely necessary (aspect ratio difference > 1%)
         padding_start = time.time()
         if abs(crop_aspect_ratio - self.target_aspect_ratio) > 0.01:
-            logger.debug(f"Frame - applying padding to match target aspect ratio")
             # Compute target dimensions that match the target aspect ratio
             target_width, target_height = self._calculate_target_dimensions(
                 frame_width, frame_height, self.target_aspect_ratio

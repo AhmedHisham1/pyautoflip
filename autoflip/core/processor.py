@@ -403,29 +403,24 @@ class AutoFlipProcessor:
             # Return to the beginning of the scene
             video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-            # Process frames in small batches to optimize I/O
-            batch_size = 30  # Process 30 frames at a time (adjustable)
-            for batch_start in range(0, scene_length, batch_size):
-                batch_end = min(batch_start + batch_size, scene_length)
+            for i in range(scene_length):
+                # Read frame at original resolution
+                ret, frame = video_reader.cap.read()
+                if not ret:
+                    logger.warning(
+                        f"Failed to read frame at position {start_frame + i}"
+                    )
+                    continue
 
-                for i in range(batch_start, batch_end):
-                    # Read frame at original resolution
-                    ret, frame = video_reader.cap.read()
-                    if not ret:
-                        logger.warning(
-                            f"Failed to read frame at position {start_frame + i}"
-                        )
-                        continue
+                # Get relative crop window for this frame
+                rel_crop_window = rel_crop_windows[i]
 
-                    # Get relative crop window for this frame
-                    rel_crop_window = rel_crop_windows[i]
+                # Apply crop window with relative coordinates
+                cropped_frame = cropper.apply_crop_window(frame, rel_crop_window)
 
-                    # Apply crop window with relative coordinates
-                    cropped_frame = cropper.apply_crop_window(frame, rel_crop_window)
-
-                    # Write to output
-                    video_writer.write_frame(cropped_frame)
-                    frames_processed += 1
+                # Write to output
+                video_writer.write_frame(cropped_frame)
+                frames_processed += 1
 
         except Exception as e:
             logger.error(f"Scene cropping failed: {e}.")
