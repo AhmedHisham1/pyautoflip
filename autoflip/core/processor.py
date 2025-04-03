@@ -1,12 +1,6 @@
-"""
-Main processor for AutoFlip video reframing.
-"""
-
-import os
 import time
 import logging
-from typing import List, Optional
-
+from typing import List, Tuple, Dict, Any
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -15,7 +9,7 @@ from autoflip.detection.shot_boundary import ShotBoundaryDetector
 from autoflip.detection.face_detector import FaceDetector
 from autoflip.detection.object_detector import ObjectDetector
 from autoflip.cropping.scene_cropper import SceneCropper
-from autoflip.cropping.visualization import VisualizationUtils
+from autoflip.utils.visualizer import Visualizer
 from autoflip.utils.video import VideoReader, VideoWriter
 
 logger = logging.getLogger("autoflip")
@@ -24,19 +18,19 @@ logger = logging.getLogger("autoflip")
 class AutoFlipProcessor:
     """
     Main processor for AutoFlip video reframing.
-    
+
     This class orchestrates the entire process of reframing a video:
     1. Breaking the video into shots/scenes
     2. Detecting important content in each frame
     3. Determining optimal crop windows
     4. Generating the reframed video
-    
+
     Attributes:
         target_aspect_ratio (str): Target aspect ratio in "width:height" format
         motion_threshold (float): Threshold for camera motion (0.0-1.0)
         padding_method (str): Method for padding ("blur" or "solid_color")
     """
-    
+
     def __init__(
         self,
         target_aspect_ratio: str = "9:16",
@@ -46,44 +40,46 @@ class AutoFlipProcessor:
     ):
         """
         Initialize the AutoFlip processor.
-        
+
         Args:
             target_aspect_ratio: Target aspect ratio as "width:height" (e.g., "9:16")
             motion_threshold: Threshold for camera motion (0.0-1.0)
             padding_method: Method for padding ("blur" or "solid_color")
-            debug_mode: If True, draw rectangles to show crop regions instead of actually cropping
+            debug_mode: If True, draw debug visualizations
         """
         self.target_aspect_ratio = self._parse_aspect_ratio(target_aspect_ratio)
         self.motion_threshold = motion_threshold
         self.padding_method = padding_method
         self.debug_mode = debug_mode
-        
-        logger.info(f"Initializing AutoFlipProcessor with target AR: {target_aspect_ratio}, motion threshold: {motion_threshold}")
-        logger.info(f"Debug mode: {debug_mode}, Padding method: {padding_method}")
-        
+
+        logger.debug(
+            f"Initializing AutoFlipProcessor with target AR: {target_aspect_ratio}, motion threshold: {motion_threshold}"
+        )
+        logger.debug(f"Debug mode: {debug_mode}, Padding method: {padding_method}")
+
         # Initialize detectors
         self.shot_detector = ShotBoundaryDetector()
         self.face_detector = FaceDetector()
         self.object_detector = ObjectDetector()
-        
+
         # Directory for debug output
         self.debug_dir = "debug_frames"
-        
+
         # Timing information
         self.timing_info = {}
-        
+
     def _parse_aspect_ratio(self, aspect_ratio_str: str) -> float:
         """
         Parse aspect ratio string into a float.
-        
+
         Args:
             aspect_ratio_str: Aspect ratio as "width:height" (e.g., "9:16")
-            
+
         Returns:
             float: Aspect ratio as width/height
         """
         try:
-            width, height = map(int, aspect_ratio_str.split(':'))
+            width, height = map(int, aspect_ratio_str.split(":"))
             ratio = width / height
             logger.debug(f"Parsed aspect ratio {aspect_ratio_str} to {ratio:.4f}")
             return ratio
@@ -91,7 +87,7 @@ class AutoFlipProcessor:
             error_msg = f"Invalid aspect ratio: {aspect_ratio_str}. Format should be 'width:height' (e.g., '9:16')."
             logger.error(error_msg)
             raise ValueError(error_msg)
-    
+
     def process_video(
         self,
         input_path: str,
@@ -99,7 +95,9 @@ class AutoFlipProcessor:
     ) -> str:
         """
         Process a video file and generate a reframed version.
-        
+
+        Uses a streaming approach to avoid loading all frames in memory at once.
+
         Args:
             input_path: Path to the input video file
             output_path: Path to save the output video
@@ -108,44 +106,94 @@ class AutoFlipProcessor:
         """
         # Start total timing
         total_start_time = time.time()
-        
-        # Setup debug mode if enabled
-        if self.debug_mode:
-            os.makedirs(self.debug_dir, exist_ok=True)
-            logger.info(f"Debug frames will be saved to {self.debug_dir}")
-            logger.info("Debug mode enabled with simplified visualization")
-            
-            # Initialize visualization system
-            VisualizationUtils.set_debug_directory(self.debug_dir)
-        
+
         # Step 1: Initialize video reader
-        logger.info(f"Reading video: {input_path}")
+        video_reader, metadata = self._initialize_video(input_path)
+
+        # Step 2: Initialize video writer
+        video_writer = self._initialize_writer(output_path, video_reader)
+
+        # Step 3: Detect scene boundaries
+        scene_boundaries = self._detect_scenes(input_path, metadata["frame_count"])
+
+        # Step 4: Process each scene
+        total_frames_processed = self._process_scenes(
+            scene_boundaries, video_reader, video_writer
+        )
+
+        # Step 5: Finalize output video
+        output_path = video_writer.finalize()
+
+        # Log summary statistics
+        self._log_processing_summary(total_start_time, total_frames_processed)
+
+        logger.debug(f"Completed processing. Output saved to: {output_path}")
+        return output_path
+
+    def _initialize_video(self, input_path: str):
+        """
+        Initialize the video reader and get metadata.
+
+        Args:
+            input_path: Path to the input video file
+
+        Returns:
+            video_reader: VideoReader object
+            metadata: Metadata of the video: width, height, fps, frame_count, aspect_ratio, duration
+        """
+        logger.debug(f"Reading video: {input_path}")
         start_time = time.time()
+
         video_reader = VideoReader(input_path)
-        
-        # Get video metadata
         metadata = video_reader.get_metadata()
-        logger.info(f"Video info: {metadata['width']}x{metadata['height']} @ {metadata['fps']} fps")
-        logger.info(f"Total frames: {metadata['frame_count']} ({metadata['duration']:.2f} seconds)")
-            
+
+        logger.debug(
+            f"Video info: {metadata['width']}x{metadata['height']} @ {metadata['fps']} fps"
+        )
+        logger.debug(
+            f"Total frames: {metadata['frame_count']} ({metadata['duration']:.2f} seconds)"
+        )
+
         self.timing_info["video_setup"] = time.time() - start_time
-        logger.info(f"Video setup completed in {self.timing_info['video_setup']:.2f} seconds")
-        
-        # Step 2: Detect shot boundaries (using direct file access which is more efficient)
-        logger.info("Detecting scene boundaries...")
+        logger.debug(
+            f"Video setup completed in {self.timing_info['video_setup']:.2f} seconds"
+        )
+
+        return video_reader, metadata
+
+    def _detect_scenes(
+        self, input_path: str, frame_count: int
+    ) -> List[Tuple[int, int]]:
+        """
+        Detect scene boundaries in the video.
+
+        Args:
+            input_path: Path to the input video file
+            frame_count: Number of frames in the video
+
+        Returns:
+            List of scene boundaries: [(start_frame, end_frame), ...]
+        """
+        logger.debug("Detecting scene boundaries...")
         start_time = time.time()
-        
+
         try:
             shot_boundaries = self.shot_detector.detect(input_path)
-            
+
             self.timing_info["shot_detection"] = time.time() - start_time
-            logger.info(f"Shot detection completed in {self.timing_info['shot_detection']:.2f} seconds")
-            logger.info(f"Found {len(shot_boundaries)} boundaries at frames {shot_boundaries}")
-            
+            logger.debug(
+                f"Shot detection completed in {self.timing_info['shot_detection']:.2f} seconds"
+            )
+            logger.debug(
+                f"Found {len(shot_boundaries)} boundaries at frames {shot_boundaries}"
+            )
+
             # If no boundaries detected, treat the entire video as one scene
             if not shot_boundaries:
-                logger.info("No scene changes detected. Treating the video as a single scene.")
-                scene_boundaries = [(0, metadata['frame_count'])]
+                logger.warning(
+                    "No scene changes detected. Treating the video as a single scene."
+                )
+                scene_boundaries = [(0, frame_count)]
             else:
                 # Convert boundaries to scene ranges
                 scene_boundaries = []
@@ -154,335 +202,258 @@ class AutoFlipProcessor:
                     scene_boundaries.append((last_boundary, boundary))
                     last_boundary = boundary
                 # Add the last scene
-                scene_boundaries.append((last_boundary, metadata['frame_count']))
-                
+                scene_boundaries.append((last_boundary, frame_count))
+
         except Exception as e:
             self.timing_info["shot_detection"] = time.time() - start_time
             logger.error(f"Scene detection failed: {e}")
-            logger.info("Falling back to processing the video as a single scene")
-            scene_boundaries = [(0, metadata['frame_count'])]
-        
-        logger.info(f"Processing {len(scene_boundaries)} scenes...")
-        
-        # Initialize video writer with EXACT same fps as input
+            logger.warning("Falling back to processing the video as a single scene")
+            scene_boundaries = [(0, frame_count)]
+
+        logger.debug(f"Processing {len(scene_boundaries)} scenes...")
+        return scene_boundaries
+
+    def _initialize_writer(self, output_path: str, video_reader: VideoReader):
+        """
+        Initialize the video writer.
+
+        Args:
+            output_path: Path to save the output video
+            video_reader: VideoReader object
+        """
         video_writer = VideoWriter(
-            output_path,
-            fps=video_reader.fps,
-            audio_path=video_reader.extract_audio()
+            output_path, fps=video_reader.fps, audio_path=video_reader.extract_audio()
         )
-        
+
         # Pass input metadata to the writer to help with verification
         video_writer.set_input_metadata(
             frame_count=video_reader.frame_count,
-            duration=video_reader.frame_count / video_reader.fps
+            duration=video_reader.frame_count / video_reader.fps,
         )
-        
-        # Make sure we're starting at the beginning of the video
-        video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
+
+        return video_writer
+
+    def _process_scenes(
+        self,
+        scene_boundaries: List[Tuple[int, int]],
+        video_reader: VideoReader,
+        video_writer: VideoWriter,
+    ) -> int:
+        """Process each scene in the video.
+
+        Args:
+            scene_boundaries: List of scene boundaries: [(start_frame, end_frame), ...]
+            video_reader: VideoReader object
+            video_writer: VideoWriter object
+
+        Returns:
+            Total number of frames processed
+        """
         total_detection_time = 0
         total_cropping_time = 0
         total_frames_processed = 0
-        frame_count = 0
-        
+
         # Process each scene sequentially
-        for scene_idx, (start_frame, end_frame) in enumerate(scene_boundaries):
+        for scene_idx, (start_frame, end_frame) in tqdm(
+            enumerate(scene_boundaries),
+            total=len(scene_boundaries),
+            desc="Processing scenes",
+        ):
             scene_length = end_frame - start_frame
-            logger.info(f"Processing scene {scene_idx+1}/{len(scene_boundaries)} with {scene_length} frames...")
-            
-            # Skip to the correct starting frame position
-            if frame_count < start_frame:
-                frames_to_skip = start_frame - frame_count
-                logger.info(f"Skipping {frames_to_skip} frames to reach scene start")
-                
-                for _ in range(frames_to_skip):
-                    ret = video_reader.cap.grab()  # Just grab the frame without decoding it (faster)
-                    if not ret:
-                        logger.warning(f"Could not skip to frame {start_frame}, video ended prematurely")
-                        break
-                    frame_count += 1
-            
-            # Read all frames in this scene
-            scene_frames = []
-            scene_frame_count = 0
-            
-            while frame_count < end_frame:
-                ret, frame = video_reader.cap.read()
-                if not ret:
-                    logger.warning(f"Reached end of video at frame {frame_count}, expected end at {end_frame}")
-                    break
-                
-                scene_frames.append(frame)
-                frame_count += 1
-                scene_frame_count += 1
-            
-            if not scene_frames:
-                logger.warning(f"No frames read for scene {scene_idx+1}, skipping")
-                continue
-            
-            # Step 3.1: Detect faces and objects in key frames
+            logger.debug(
+                f"Processing scene {scene_idx+1}/{len(scene_boundaries)} with {scene_length} frames..."
+            )
+
+            # Get key frames and detections
             detection_start_time = time.time()
-            key_frame_indices = self._select_key_frames(scene_frames)
-            
-            face_detections = {}
-            object_detections = {}
-            
-            # Using tqdm to show progress of detection
-            for idx in tqdm(key_frame_indices, desc="Detecting content"):
-                frame = self._downsample_frame(scene_frames[idx])
-                try:
-                    face_detections[idx] = self.face_detector.detect(frame)
-                except Exception as e:
-                    logger.error(f"Face detection failed for frame {idx}: {e}")
-                    face_detections[idx] = []
-                    
-                try:
-                    object_detections[idx] = self.object_detector.detect(frame)
-                except Exception as e:
-                    logger.error(f"Object detection failed for frame {idx}: {e}")
-                    object_detections[idx] = []
-            
+            key_frame_data = self._process_key_frames(
+                video_reader, start_frame, scene_length
+            )
+
+            if not key_frame_data:
+                logger.error("No key frames available for scene processing")
+                continue
+
             detection_time = time.time() - detection_start_time
             total_detection_time += detection_time
-            
-            # Step 3.2: Create scene cropper
+
+            # Process the scene with crop windows
             cropping_start_time = time.time()
-            cropper = SceneCropper(
-                target_aspect_ratio=self.target_aspect_ratio,
-                motion_threshold=self.motion_threshold,
-                padding_method=self.padding_method,
-                debug_mode=self.debug_mode
+            frames_processed = self._apply_cropping(
+                video_reader, video_writer, start_frame, scene_length, key_frame_data
             )
-            
-            # Process scene to establish cropping strategy
-            try:
-                cropped_frames, debug_vis_frames = cropper.process_scene(
-                    scene_frames,
-                    face_detections,
-                    object_detections,
-                    key_frame_indices
-                )
-                
-                # Write frames to output
-                for frame in cropped_frames:
-                    video_writer.write_frame(frame)
-                    total_frames_processed += 1
-                
-                # Process debug visualization if needed
-                if self.debug_mode:
-                    first_key_idx = key_frame_indices[0]
-                    frame_info = f"Scene: {scene_idx+1}/{len(scene_boundaries)}, Frame: {first_key_idx}/{len(scene_frames)}"
-                    
-                    # Get detection visualization frame
-                    detection_frame = debug_vis_frames.get(first_key_idx)
-                    
-                    # Get trajectory visualization frame
-                    trajectory_frame = debug_vis_frames.get(-1)  # Special key for trajectory
-                    
-                    # Get crop window
-                    current_crop_window = cropper.current_crop_window if hasattr(cropper, 'current_crop_window') else None
-                    
-                    # Debug visualization
-                    debug_path = VisualizationUtils.get_standard_debug_path(
-                        self.debug_dir, scene_idx, first_key_idx)
-                    
-                    VisualizationUtils.display_processing_view(
-                        original_frame=scene_frames[first_key_idx],
-                        detection_frame=detection_frame,
-                        cropped_frame=cropped_frames[first_key_idx] if first_key_idx < len(cropped_frames) else None,
-                        crop_window=current_crop_window,
-                        trajectory_frame=trajectory_frame,
-                        frame_info=frame_info,
-                        save_path=debug_path
-                    )
-                
-            except Exception as e:
-                logger.error(f"Scene cropping failed: {e}. Falling back to center crop.")
-                
-                # Fall back to center crop
-                height, width = scene_frames[0].shape[:2]
-                target_width = int(height * self.target_aspect_ratio)
-                
-                # Calculate center crop dimensions
-                if target_width <= width:
-                    # Need to crop width
-                    x = (width - target_width) // 2
-                    y = 0
-                    crop_width = target_width
-                    crop_height = height
-                else:
-                    # Need to crop height
-                    target_height = int(width / self.target_aspect_ratio)
-                    x = 0
-                    y = (height - target_height) // 2
-                    crop_width = width
-                    crop_height = target_height
-                
-                logger.info(f"Using center crop: ({x}, {y}, {crop_width}, {crop_height})")
-                
-                # Apply center crop to all frames in the scene
-                for frame in scene_frames:
-                    cropped = frame[y:y+crop_height, x:x+crop_width]
-                    video_writer.write_frame(cropped)
-                    total_frames_processed += 1
-            
+
+            total_frames_processed += frames_processed
             cropping_time = time.time() - cropping_start_time
             total_cropping_time += cropping_time
-            
-            logger.info(f"Scene {scene_idx+1} processing summary:")
-            logger.info(f"    - Detection time: {detection_time:.2f} seconds")
-            logger.info(f"    - Cropping time: {cropping_time:.2f} seconds")
-            logger.info(f"    - Processed {scene_frame_count} frames")
-        
+
+            logger.debug(f"Scene {scene_idx+1} processing summary:")
+            logger.debug(f"    - Detection time: {detection_time:.2f} seconds")
+            logger.debug(f"    - Cropping time: {cropping_time:.2f} seconds")
+            logger.debug(f"    - Processed {scene_length} frames")
+
         self.timing_info["detection"] = total_detection_time
         self.timing_info["cropping"] = total_cropping_time
-        
-        # Finalize output video
-        output_path = video_writer.finalize()
-        
-        # Calculate and print total time
+
+        return total_frames_processed
+
+    def _process_key_frames(
+        self, video_reader: VideoReader, start_frame: int, scene_length: int
+    ) -> Dict[str, Any]:
+        """Sample and process key frames for content detection."""
+        # Select key frame indices (sparse sampling)
+        frame_count = scene_length
+        num_samples = min(8, max(3, frame_count // 60 + 3)) if frame_count > 10 else 3
+        relative_key_indices = sorted(
+            [int(i) for i in np.linspace(0, frame_count - 1, num_samples)]
+        )
+        # Convert to absolute frame indices
+        key_frame_indices = [idx + start_frame for idx in relative_key_indices]
+
+        logger.debug(
+            f"Selected {len(key_frame_indices)} key frames for content detection"
+        )
+
+        # Read only the key frames
+        key_frames = {}
+        face_detections = {}
+        object_detections = {}
+
+        # Read and process key frames only
+        for key_idx in key_frame_indices:
+            # Skip frames if needed to reach the next key frame
+            video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, key_idx)
+
+            # Read the key frame
+            ret, frame = video_reader.cap.read()
+            if not ret:
+                logger.warning(f"Failed to read frame at position {key_idx}")
+                continue
+
+            # Store frame
+            key_frames[key_idx - start_frame] = frame
+
+            # Detect faces
+            try:
+                faces = self.face_detector.detect(frame)
+                face_detections[key_idx - start_frame] = faces
+            except Exception as e:
+                logger.error(f"Face detection failed for frame {key_idx}: {e}")
+                face_detections[key_idx - start_frame] = []
+
+            # Detect objects
+            try:
+                objects = self.object_detector.detect(frame)
+                object_detections[key_idx - start_frame] = objects
+            except Exception as e:
+                logger.error(f"Object detection failed for frame {key_idx}: {e}")
+                object_detections[key_idx - start_frame] = []
+
+        if not key_frames:
+            return None
+
+        return {
+            "key_frames": key_frames,
+            "face_detections": face_detections,
+            "object_detections": object_detections,
+        }
+
+    def _apply_cropping(
+        self,
+        video_reader: VideoReader,
+        video_writer: VideoWriter,
+        start_frame: int,
+        scene_length: int,
+        key_frame_data: Dict[str, Any],
+    ) -> int:
+        """Apply cropping to the scene using the key frame detections.
+
+        Args:
+            video_reader: VideoReader object
+            video_writer: VideoWriter object
+            start_frame: Start frame of the scene
+            scene_length: Length of the scene
+            key_frame_data: Key frame data
+
+        Returns:
+            Total number of frames processed
+        """
+        frames_processed = 0
+
+        # Create scene cropper
+        cropper = SceneCropper(
+            target_aspect_ratio=self.target_aspect_ratio,
+            motion_threshold=self.motion_threshold,
+            padding_method=self.padding_method,
+            debug_mode=self.debug_mode,
+        )
+
+        try:
+            # Process scene to get crop windows
+            rel_crop_windows = cropper.process_scene(
+                key_frame_data["key_frames"],
+                key_frame_data["face_detections"],
+                key_frame_data["object_detections"],
+                scene_length,
+            )
+
+            if not rel_crop_windows:
+                raise ValueError("No crop windows generated")
+
+            # Return to the beginning of the scene
+            video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            # Process frames in small batches to optimize I/O
+            batch_size = 30  # Process 30 frames at a time (adjustable)
+            for batch_start in range(0, scene_length, batch_size):
+                batch_end = min(batch_start + batch_size, scene_length)
+
+                for i in range(batch_start, batch_end):
+                    # Read frame at original resolution
+                    ret, frame = video_reader.cap.read()
+                    if not ret:
+                        logger.warning(
+                            f"Failed to read frame at position {start_frame + i}"
+                        )
+                        continue
+
+                    # Get relative crop window for this frame
+                    rel_crop_window = rel_crop_windows[i]
+
+                    # Apply crop window with relative coordinates
+                    cropped_frame = cropper.apply_crop_window(frame, rel_crop_window)
+
+                    # Write to output
+                    video_writer.write_frame(cropped_frame)
+                    frames_processed += 1
+
+        except Exception as e:
+            logger.error(f"Scene cropping failed: {e}.")
+            raise e
+
+        return frames_processed
+
+    def _log_processing_summary(self, total_start_time, total_frames_processed):
+        """Log the processing summary statistics."""
         total_time = time.time() - total_start_time
         self.timing_info["total"] = total_time
-        logger.info("\n===== Processing Summary =====")
-        logger.info(f"Total processing time: {self.timing_info['total']:.2f} seconds")
-        logger.info(f"Frames processed: {total_frames_processed}")
-        logger.info(f"Frames per second: {total_frames_processed / self.timing_info['total']:.2f}")
-        logger.info(f"Video setup: {self.timing_info.get('video_setup', 0):.2f} seconds ({self.timing_info.get('video_setup', 0) / self.timing_info['total'] * 100:.1f}%)")
-        logger.info(f"Shot detection: {self.timing_info['shot_detection']:.2f} seconds ({self.timing_info['shot_detection'] / self.timing_info['total'] * 100:.1f}%)")
-        logger.info(f"Content detection: {self.timing_info['detection']:.2f} seconds ({self.timing_info['detection'] / self.timing_info['total'] * 100:.1f}%)")
-        logger.info(f"Cropping: {self.timing_info['cropping']:.2f} seconds ({self.timing_info['cropping'] / self.timing_info['total'] * 100:.1f}%)")
-        logger.info("===========================")
-        
-        # Clean up visualization if debug mode was enabled
-        if self.debug_mode:
-            # Show processing finished message
-            logger.info("Processing finished. Close visualization window to continue...")
-            
-            # Create a simple summary image
-            summary_img = self._create_summary_visualization(total_frames_processed, total_time)
-            if summary_img is not None:
-                # Create a final frame info string for the summary
-                frame_info = f"Total time: {total_time:.2f}s, Frames: {total_frames_processed}"
-                
-                # Display the summary
-                VisualizationUtils.display_processing_view(
-                    original_frame=summary_img,
-                    detection_frame=None,
-                    cropped_frame=None,
-                    crop_window=None,
-                    trajectory_frame=None,
-                    frame_info=frame_info,
-                    save_path=os.path.join(self.debug_dir, "processing_summary.jpg")
-                )
-                
-                # Keep window open until user closes it
-                cv2.waitKey(0)
-            
-            # Close debug window
-            VisualizationUtils.close_debug_window()
-        
-        logger.info(f"Completed processing. Output saved to: {output_path}")
-        return output_path
-        
-    def _downsample_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Downsample a frame for more efficient processing."""
-        target_width = 480
-        h, w = frame.shape[:2]
-        scale = target_width / w
-        new_size = (target_width, int(h * scale))
-        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
-    
-    def _select_key_frames(self, scene_frames: List[np.ndarray]) -> List[int]:
-        """
-        Select key frames from a scene for content detection.
-        
-        Args:
-            scene_frames: List of frames in the scene
-            
-        Returns:
-            List of indices for key frames
-        """
-        frame_count = len(scene_frames)
-        
-        if frame_count < 3:
-            return list(range(frame_count))
-            
-        # Determine number of samples based on scene length
-        num_samples = min(8, max(3, frame_count // 60 + 3)) if frame_count > 10 else 3
-        
-        # Generate evenly spaced frame indices
-        return sorted([int(i) for i in np.linspace(0, frame_count - 1, num_samples)])
 
-    def _create_summary_visualization(self, total_frames: int, total_time: float) -> Optional[np.ndarray]:
-        """Create a summary visualization with timing information."""
-        try:
-            # Create a blank image
-            img = np.ones((600, 800, 3), dtype=np.uint8) * 255
-            
-            # Add title
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(img, "AutoFlip Processing Summary", (50, 50), font, 1.2, (0, 0, 0), 2, cv2.LINE_AA)
-            
-            # Add timing information
-            y_pos = 100
-            line_height = 30
-            
-            # Add fps and total frames
-            cv2.putText(img, f"Total frames processed: {total_frames}", (50, y_pos), font, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
-            y_pos += line_height
-            cv2.putText(img, f"Frames per second: {total_frames / total_time:.2f}", (50, y_pos), font, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
-            y_pos += line_height * 2
-            
-            # Add detailed timing
-            cv2.putText(img, f"Total processing time: {total_time:.2f} seconds", (50, y_pos), font, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
-            y_pos += line_height
-            
-            # Add breakdown of time spent
-            for key, value in self.timing_info.items():
-                if key != "total":
-                    percentage = value / total_time * 100
-                    cv2.putText(img, f"{key.capitalize()}: {value:.2f}s ({percentage:.1f}%)", 
-                               (70, y_pos), font, 0.7, (0, 0, 0), 1, cv2.LINE_AA)
-                    y_pos += line_height
-            
-            # Add bar chart
-            y_pos += line_height
-            cv2.putText(img, "Time Distribution:", (50, y_pos), font, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
-            y_pos += line_height
-            
-            # Draw bar chart
-            chart_width = 600
-            chart_height = 30
-            chart_left = 100
-            
-            for key, value in self.timing_info.items():
-                if key != "total":
-                    percentage = value / total_time
-                    bar_width = int(chart_width * percentage)
-                    
-                    # Pick color based on key
-                    if key == "video_setup":
-                        color = (255, 150, 150)  # Light red
-                    elif key == "shot_detection":
-                        color = (150, 255, 150)  # Light green
-                    elif key == "detection":
-                        color = (150, 150, 255)  # Light blue
-                    elif key == "cropping":
-                        color = (255, 255, 150)  # Light yellow
-                    else:
-                        color = (200, 200, 200)  # Light gray
-                    
-                    # Draw the bar
-                    cv2.rectangle(img, (chart_left, y_pos), (chart_left + bar_width, y_pos + chart_height), color, -1)
-                    cv2.rectangle(img, (chart_left, y_pos), (chart_left + bar_width, y_pos + chart_height), (0, 0, 0), 1)
-                    
-                    # Add label
-                    cv2.putText(img, f"{key}", (chart_left - 90, y_pos + 20), font, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
-                    cv2.putText(img, f"{percentage*100:.1f}%", (chart_left + bar_width + 10, y_pos + 20), font, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
-                    
-                    y_pos += chart_height + 10
-            
-            return img
-        except Exception as e:
-            logger.error(f"Error creating summary visualization: {e}")
-            return None 
+        print("\n===== Processing Summary =====")
+        print(f"Total processing time: {self.timing_info['total']:.2f} seconds")
+        print(f"Frames processed: {total_frames_processed}")
+        print(
+            f"Frames per second: {total_frames_processed / self.timing_info['total']:.2f}"
+        )
+        print(
+            f"Video setup: {self.timing_info.get('video_setup', 0):.2f} seconds ({self.timing_info.get('video_setup', 0) / self.timing_info['total'] * 100:.1f}%)"
+        )
+        print(
+            f"Shot detection: {self.timing_info['shot_detection']:.2f} seconds ({self.timing_info['shot_detection'] / self.timing_info['total'] * 100:.1f}%)"
+        )
+        print(
+            f"Content detection: {self.timing_info['detection']:.2f} seconds ({self.timing_info['detection'] / self.timing_info['total'] * 100:.1f}%)"
+        )
+        print(
+            f"Cropping: {self.timing_info['cropping']:.2f} seconds ({self.timing_info['cropping'] / self.timing_info['total'] * 100:.1f}%)"
+        )
+        print("===========================")

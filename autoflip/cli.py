@@ -70,17 +70,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     reframe_parser.add_argument(
         '-d', '--debug',
         action='store_true',
-        help='Enable debug mode: shows visualization, saves debug frames, and provides comprehensive debug information'
-    )
-    reframe_parser.add_argument(
-        '--log-level',
-        choices=['ERROR', 'WARNING', 'INFO', 'DEBUG', 'DEBUG_DETAIL'],
-        default='INFO',
-        help='Set the logging level for detailed output'
-    )
-    reframe_parser.add_argument(
-        '--log-file',
-        help='Save logs to the specified file'
+        help='Enable debug mode: shows visualization, saves debug frames, provides comprehensive debug information, sets log level to DEBUG, and saves logs to autoflip.log'
     )
     
     parsed_args = parser.parse_args(args)
@@ -111,10 +101,9 @@ def main(args: Optional[List[str]] = None) -> int:
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir)
                 
-            # Configure logging to file if requested
-            log_file = None
-            if hasattr(parsed_args, 'log_file') and parsed_args.log_file:
-                log_file = parsed_args.log_file
+            # Set log level and log file based on debug mode
+            log_level = "DEBUG" if parsed_args.debug else "INFO"
+            log_file = "autoflip.log" if parsed_args.debug else None
                 
             # Process the video
             output_path = reframe_video(
@@ -124,7 +113,7 @@ def main(args: Optional[List[str]] = None) -> int:
                 motion_threshold=parsed_args.motion_threshold,
                 padding_method=parsed_args.padding_method,
                 debug_mode=parsed_args.debug,
-                log_level=parsed_args.log_level,
+                log_level=log_level,
                 log_file=log_file
             )
             

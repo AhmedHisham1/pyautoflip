@@ -157,7 +157,7 @@ class DetectionProcessor:
         is_talking_head = talking_head_count >= len(key_frame_indices) * 0.6
         
         if is_talking_head:
-            logger.info("Detected talking head video - optimizing for face framing")
+            logger.debug("Detected talking head video - optimizing for face framing")
             
         return is_talking_head
         

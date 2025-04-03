@@ -45,7 +45,7 @@ class VideoReader:
         Get video metadata.
         
         Returns:
-            Dictionary containing video metadata
+            Dictionary containing video metadata: width, height, fps, frame_count, aspect_ratio, duration
         """
         return {
             "width": self.width,
@@ -82,7 +82,7 @@ class VideoReader:
             ]
             
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            logger.info(f"Successfully extracted audio to {self.audio_temp_path}")
+            logger.debug(f"Successfully extracted audio to {self.audio_temp_path}")
             return self.audio_temp_path
         except (subprocess.SubprocessError, OSError) as e:
             logger.warning(f"Could not extract audio from video: {str(e)}")
@@ -170,7 +170,7 @@ class VideoWriter:
         if not self.writer.isOpened():
             raise RuntimeError(f"Failed to open VideoWriter with codec {self.codec} and fps {self.fps}")
             
-        logger.info(f"Initialized video writer with dimensions {self.frame_size} and fps {self.fps}")
+        logger.debug(f"Initialized video writer with dimensions {self.frame_size} and fps {self.fps}")
         
     def write_frame(self, frame: np.ndarray) -> None:
         """
@@ -217,7 +217,7 @@ class VideoWriter:
         # Show progress at intervals if total frames is known
         if self.total_expected_frames:
             if self.frame_count % max(1, self.total_expected_frames // 100) == 0:
-                logger.info(f"\rWriting frame {self.frame_count}/{self.total_expected_frames} "
+                logger.debug(f"\rWriting frame {self.frame_count}/{self.total_expected_frames} "
                       f"({self.frame_count/self.total_expected_frames*100:.1f}%)", 
                       end="", flush=True)
     
@@ -238,7 +238,7 @@ class VideoWriter:
         self.writer = None
         
         # Show final count
-        logger.info(f"\rWrote {self.frame_count} frames (100%)" + " " * 20)
+        logger.debug(f"\rWrote {self.frame_count} frames (100%)" + " " * 20)
         
         # Combine with audio if available
         if self.audio_path and os.path.exists(self.audio_path):
@@ -249,7 +249,7 @@ class VideoWriter:
     def _combine_audio_video(self) -> None:
         """Combine the video with the audio stream."""
         try:
-            logger.info("Combining video with audio...")
+            logger.debug("Combining video with audio...")
             
             # First, get input video stream info to verify frame rate consistency
             probe_cmd = [
@@ -263,7 +263,7 @@ class VideoWriter:
             
             probe_result = subprocess.run(probe_cmd, check=True, capture_output=True, text=True)
             frame_rate_str = probe_result.stdout.strip()
-            logger.info(f"Detected video frame rate: {frame_rate_str}")
+            logger.debug(f"Detected video frame rate: {frame_rate_str}")
             
             # Use more accurate ffmpeg command for proper audio sync
             cmd = [
@@ -282,7 +282,7 @@ class VideoWriter:
             
             # Run the command
             result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            logger.info("Audio/video combination complete")
+            logger.debug("Audio/video combination complete")
             
             # Verify output duration matches original
             try:
@@ -309,8 +309,8 @@ class VideoWriter:
                 orig_duration = float(orig_result.stdout.strip())
                 output_duration = float(output_result.stdout.strip())
                 
-                logger.info(f"Original video duration: {orig_duration:.2f}s")
-                logger.info(f"Output video duration: {output_duration:.2f}s")
+                logger.debug(f"Original video duration: {orig_duration:.2f}s")
+                logger.debug(f"Output video duration: {output_duration:.2f}s")
                 
                 # Check for significant mismatch (more than 1 second or 5%)
                 if abs(orig_duration - output_duration) > max(1.0, orig_duration * 0.05):
