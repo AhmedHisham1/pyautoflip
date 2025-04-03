@@ -4,6 +4,8 @@ from typing import List, Tuple, Dict, Any
 import cv2
 import numpy as np
 from tqdm import tqdm
+import concurrent.futures
+import os
 
 from autoflip.detection.shot_boundary import ShotBoundaryDetector
 from autoflip.detection.face_detector import FaceDetector
@@ -402,25 +404,42 @@ class AutoFlipProcessor:
 
             # Return to the beginning of the scene
             video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-            for i in range(scene_length):
-                # Read frame at original resolution
-                ret, frame = video_reader.cap.read()
-                if not ret:
-                    logger.warning(
-                        f"Failed to read frame at position {start_frame + i}"
-                    )
-                    continue
-
-                # Get relative crop window for this frame
-                rel_crop_window = rel_crop_windows[i]
-
-                # Apply crop window with relative coordinates
-                cropped_frame = cropper.apply_crop_window(frame, rel_crop_window)
-
-                # Write to output
-                video_writer.write_frame(cropped_frame)
-                frames_processed += 1
+            
+            # Process frames in batches to avoid memory issues
+            batch_size = 60
+            current_frame = 0
+            
+            while current_frame < scene_length:
+                # Calculate batch range
+                batch_end = min(current_frame + batch_size, scene_length)
+                batch_frames = []
+                
+                # Read batch of frames
+                for i in range(current_frame, batch_end):
+                    ret, frame = video_reader.cap.read()
+                    if not ret:
+                        logger.warning(
+                            f"Failed to read frame at position {start_frame + i}"
+                        )
+                        continue
+                    
+                    rel_crop_window = rel_crop_windows[i]
+                    batch_frames.append((frame, rel_crop_window))
+                
+                # Process batch in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as executor:
+                    cropped_batch = list(executor.map(
+                        lambda x: cropper.apply_crop_window(x[0], x[1]),
+                        batch_frames
+                    ))
+                
+                # Write batch to output
+                for cropped_frame in cropped_batch:
+                    video_writer.write_frame(cropped_frame)
+                    frames_processed += 1
+                
+                # Move to next batch
+                current_frame = batch_end
 
         except Exception as e:
             logger.error(f"Scene cropping failed: {e}.")
