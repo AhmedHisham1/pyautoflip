@@ -55,7 +55,7 @@ class ObjectDetector:
         os.makedirs(model_dir, exist_ok=True)
         
         # Load YOLO model
-        logger.info(f"Loading YOLO model: {model_name}...")
+        logger.debug(f"Loading YOLO model: {model_name}...")
         self.model = YOLO(model_name)
         
     def detect(self, frame: np.ndarray) -> List[Dict[str, Any]]:

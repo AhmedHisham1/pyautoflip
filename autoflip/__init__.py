@@ -11,7 +11,6 @@ import logging
 from typing import Optional, Union
 
 from autoflip.core.processor import AutoFlipProcessor
-from autoflip.cropping.types import LogLevel
 
 # Configure root logger
 root_logger = logging.getLogger()
@@ -36,16 +35,11 @@ def configure_logging(level: Union[int, str] = "INFO", log_file: Optional[str] =
     # Handle string level names
     if isinstance(level, str):
         level = level.upper()
-        if level == 'DEBUG_DETAIL':
-            level = LogLevel.DEBUG_DETAIL.value
-        else:
-            try:
-                level = getattr(logging, level)
-            except AttributeError:
-                logger.warning(f"Invalid log level: {level}, using INFO")
-                level = logging.INFO
-    elif isinstance(level, LogLevel):
-        level = level.value
+        try:
+            level = getattr(logging, level)
+        except AttributeError:
+            logger.warning(f"Invalid log level: {level}, using INFO")
+            level = logging.INFO
     else:
         try:
             level = int(level)  # Convert to int if possible
@@ -59,7 +53,7 @@ def configure_logging(level: Union[int, str] = "INFO", log_file: Optional[str] =
     # Configure file logging if requested
     if log_file:
         # Create a file handler
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_file, mode='w') # mode='w' to overwrite
         file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
         
@@ -76,7 +70,7 @@ def reframe_video(
     padding_method: str = "blur",
     debug_mode: bool = False,
     log_level: Union[int, str] = "INFO",
-    log_file: Optional[str] = None,
+    log_file: Optional[str] = None
 ) -> str:
     """
     Reframe a video to a target aspect ratio while preserving important content.
@@ -101,7 +95,7 @@ def reframe_video(
         target_aspect_ratio=target_aspect_ratio,
         motion_threshold=motion_threshold,
         padding_method=padding_method,
-        debug_mode=debug_mode,
+        debug_mode=debug_mode
     )
     
     return processor.process_video(

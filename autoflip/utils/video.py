@@ -45,7 +45,7 @@ class VideoReader:
         Get video metadata.
         
         Returns:
-            Dictionary containing video metadata
+            Dictionary containing video metadata: width, height, fps, frame_count, aspect_ratio, duration
         """
         return {
             "width": self.width,

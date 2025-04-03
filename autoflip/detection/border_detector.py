@@ -80,7 +80,7 @@ class BorderDetector:
             # Choose frames evenly distributed throughout the video
             step = max(1, len(frames) // self.max_frames_to_process)
             frames_to_process = frames[::step][:self.max_frames_to_process]
-            logger.info(f"Border detection: Processing {len(frames_to_process)} of {len(frames)} frames")
+            logger.debug(f"Border detection: Processing {len(frames_to_process)} of {len(frames)} frames")
         else:
             frames_to_process = frames
             
@@ -116,7 +116,7 @@ class BorderDetector:
         if features["top_border"] == 0 and features["bottom_border"] == 0:
             is_letterboxed, letterbox_features = self._detect_letterbox(frame)
             if is_letterboxed:
-                logger.info("Detected letterboxed video using histogram analysis")
+                logger.debug("Detected letterboxed video using histogram analysis")
                 features.update(letterbox_features)
         
         # Check the non-border area for a dominant color
@@ -135,10 +135,6 @@ class BorderDetector:
                 dominant_color_nonborder.g,
                 dominant_color_nonborder.r
             )
-        
-        if self.debug_mode:
-            debug_frame = self._create_debug_visualization(frame, features)
-            features["debug_frame"] = debug_frame
             
         return features
         
@@ -332,7 +328,7 @@ class BorderDetector:
         # Apply defined padding
         last_border += self.border_object_padding_px
         
-        logger.info(f"Detected {direction} border: {last_border} pixels")
+        logger.debug(f"Detected {direction} border: {last_border} pixels")
         
         if direction == "top":
             features["top_border"] = last_border
@@ -487,7 +483,7 @@ class BorderDetector:
         is_letterboxed = has_significant_borders and reasonable_content
         
         if is_letterboxed:
-            logger.info(f"Letterbox detection: top={top_border}, bottom={bottom_border}, content={content_height}/{height}")
+            logger.debug(f"Letterbox detection: top={top_border}, bottom={bottom_border}, content={content_height}/{height}")
             
             features = {
                 "top_border": top_border,

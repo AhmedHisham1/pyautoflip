@@ -148,7 +148,7 @@ class CameraMotionHandler:
                 # Default to a center crop (will be adjusted later if needed)
                 crop_window = (0, 0, 100, 100)
                 
-            logger.info(f"Only one key crop window, using same crop for all {total_frames} frames: {crop_window}")
+            logger.warning(f"Only one key crop window, using same crop for all {total_frames} frames: {crop_window}")
             return [crop_window] * total_frames
         
         # Extract x and y coordinates from key crop windows
@@ -177,7 +177,7 @@ class CameraMotionHandler:
             
             fixed_window = (avg_x, avg_y, crop_width, crop_height)
             
-            logger.info(f"STATIONARY mode: using fixed position {fixed_window} for all frames")
+            logger.debug(f"STATIONARY mode: using fixed position {fixed_window} for all frames")
             return [fixed_window] * total_frames
             
         elif camera_mode == CameraMotionMode.PANNING:
@@ -190,7 +190,7 @@ class CameraMotionHandler:
             x_values = np.linspace(start_x, end_x, total_frames).astype(int)
             y_values = np.linspace(start_y, end_y, total_frames).astype(int)
             
-            logger.info(f"PANNING mode: interpolating from ({start_x}, {start_y}) to ({end_x}, {end_y}) across {total_frames} frames")
+            logger.debug(f"PANNING mode: interpolating from ({start_x}, {start_y}) to ({end_x}, {end_y}) across {total_frames} frames")
             
             # Log some interpolation samples
             sample_indices = [0, total_frames // 4, total_frames // 2, 3 * total_frames // 4, total_frames - 1]
@@ -213,7 +213,7 @@ class CameraMotionHandler:
             interp_xs = x_interp(frame_indices).astype(int)
             interp_ys = y_interp(frame_indices).astype(int)
             
-            logger.info(f"TRACKING mode: interpolating between {len(key_frame_indices)} key positions across {total_frames} frames")
+            logger.debug(f"TRACKING mode: interpolating between {len(key_frame_indices)} key positions across {total_frames} frames")
             
             # Log some interpolation samples
             sample_indices = [0, total_frames // 4, total_frames // 2, 3 * total_frames // 4, total_frames - 1]
@@ -262,7 +262,7 @@ class CameraMotionHandler:
         # For tracking, apply stronger smoothing
         sigma = self.smoothing_window / 6.0  # Heuristic for sigma value
         
-        logger.info(f"TRACKING mode: applying Gaussian smoothing with sigma={sigma:.2f} (window={self.smoothing_window})")
+        logger.debug(f"TRACKING mode: applying Gaussian smoothing with sigma={sigma:.2f} (window={self.smoothing_window})")
         
         # Calculate statistics before smoothing
         x_min, x_max = min(xs), max(xs)
