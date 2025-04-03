@@ -150,9 +150,7 @@ class PaddingEffectGenerator:
             canvas = bg_region.copy()
 
         # First, resize cropped region (will need it later)
-        resized_crop = cv2.resize(
-            crop_region, (foreground_width, foreground_height)
-        )
+        resized_crop = cv2.resize(crop_region, (foreground_width, foreground_height))
 
         # Apply blur to the padding areas
         if is_vertical_padding:

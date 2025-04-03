@@ -13,10 +13,10 @@ from autoflip.cropping.padding_effects import PaddingEffectGenerator
 from autoflip.cropping.detection_utils import DetectionProcessor
 
 __all__ = [
-    'SceneCropper',
-    'CameraMotionMode',
-    'CameraMotionHandler',
-    'FrameCropRegionComputer',
-    'PaddingEffectGenerator',
-    'DetectionProcessor'
+    "SceneCropper",
+    "CameraMotionMode",
+    "CameraMotionHandler",
+    "FrameCropRegionComputer",
+    "PaddingEffectGenerator",
+    "DetectionProcessor",
 ]
