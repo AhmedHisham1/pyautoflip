@@ -1,0 +1,61 @@
+[tool.poetry]
+name = "pyautoflip"
+version = "0.1.0"
+description = "Intelligent video reframing library that automatically crops videos to different aspect ratios while preserving important content using AI"
+authors = ["Ahmed Hisham <a7med.hish@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+homepage = "https://github.com/AhmedHisham1/pyautoflip"
+repository = "https://github.com/AhmedHisham1/pyautoflip"
+documentation = "https://github.com/AhmedHisham1/pyautoflip#readme"
+keywords = ["video", "reframing", "cropping", "computer-vision", "face-detection", "object-detection", "autoflip", "aspect-ratio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+packages = [{include = "pyautoflip"}]
+
+[tool.poetry.scripts]
+pyautoflip = "pyautoflip.cli:main"
+
+[[tool.poetry.source]]
+name = "pytorch_cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+opencv-python = "^4.11.0.86"
+numpy = "^1.24.0"
+scikit-learn = "^1.6.1"
+pillow = "^10.0.0"
+tqdm = "^4.65.0"
+scenedetect = "^0.6.6"
+insightface = "^0.7.3"
+onnxruntime = "^1.21.0"
+mediapipe = "^0.10.21"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "<8.0.0"
+black = "<24.0.0"
+isort = "<6.0.0"
+mypy = "<1.0.0"
+flake8 = "<7.0.0"
+twine = "^4.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,25 @@
+build:
+  gpu: true
+  python_version: "3.11"
+  system_packages:
+    - "ffmpeg"
+    - "libgl1-mesa-glx"
+    - "libglib2.0-0"
+  python_packages:
+    - "opencv-python==4.11.0.86"
+    - "numpy==1.24.0"
+    - "scikit-learn==1.6.1"
+    - "pillow==9.5.0"
+    - "tqdm==4.65.0"
+    - "scenedetect==0.6.6"
+    - "ultralytics==8.3.95"
+    - "insightface==0.7.3"
+    - "onnxruntime==1.21.0"
+    - "requests"
+    - "aiohttp==3.9.5"
+
+predict: "predict.py:Predictor"
+
+# Configuration for concurrent predictions
+concurrency:
+  max: 5
