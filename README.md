@@ -89,7 +89,7 @@ brew install ffmpeg
 ```bash
 git clone https://github.com/AhmedHisham1/pyautoflip.git
 cd pyautoflip
-poetry install
+uv sync
 ```
 
 ## License
