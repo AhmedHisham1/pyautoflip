@@ -51,7 +51,7 @@ class PaddingEffectGenerator:
         target_height: int,
         padding_method: str = "blur",
         background_color: Tuple[int, int, int] = None,
-        blur_cv_size: int = 75,
+        blur_cv_size: int = 45,
         overlay_opacity: float = 0.6,
         background_contrast: float = 0.6,
     ) -> np.ndarray:
@@ -153,48 +153,33 @@ class PaddingEffectGenerator:
         resized_crop = cv2.resize(crop_region, (foreground_width, foreground_height))
 
         # Apply blur to the padding areas
+        # only blur actual padding regions, not blend areas
         if is_vertical_padding:
             # For vertical padding, we only need top and bottom regions
             if padding_y > 0:
-                # Create top blur region
-                top_region = canvas[: padding_y + blur_cv_size // 4, :]
+                top_region = canvas[:padding_y, :]
                 if top_region.size > 0:
-                    # Blur entire top region at once
                     blurred_top = self._box_blur(top_region, blur_cv_size)
-                    canvas[: padding_y + blur_cv_size // 4, :] = blurred_top
+                    canvas[:padding_y, :] = blurred_top
 
             if padding_y + foreground_height < target_height:
-                # Create bottom blur region
-                bottom_region = canvas[
-                    padding_y + foreground_height - blur_cv_size // 4 :, :
-                ]
+                bottom_region = canvas[padding_y + foreground_height:, :]
                 if bottom_region.size > 0:
-                    # Blur entire bottom region at once
                     blurred_bottom = self._box_blur(bottom_region, blur_cv_size)
-                    canvas[
-                        padding_y + foreground_height - blur_cv_size // 4 :, :
-                    ] = blurred_bottom
+                    canvas[padding_y + foreground_height:, :] = blurred_bottom
         else:
             # For horizontal padding, we only need left and right regions
             if padding_x > 0:
-                # Create left blur region
-                left_region = canvas[:, : padding_x + blur_cv_size // 4]
+                left_region = canvas[:, :padding_x]
                 if left_region.size > 0:
-                    # Blur entire left region at once
                     blurred_left = self._box_blur(left_region, blur_cv_size)
-                    canvas[:, : padding_x + blur_cv_size // 4] = blurred_left
+                    canvas[:, :padding_x] = blurred_left
 
             if padding_x + foreground_width < target_width:
-                # Create right blur region
-                right_region = canvas[
-                    :, padding_x + foreground_width - blur_cv_size // 4 :
-                ]
+                right_region = canvas[:, padding_x + foreground_width:]
                 if right_region.size > 0:
-                    # Blur entire right region at once
                     blurred_right = self._box_blur(right_region, blur_cv_size)
-                    canvas[
-                        :, padding_x + foreground_width - blur_cv_size // 4 :
-                    ] = blurred_right
+                    canvas[:, padding_x + foreground_width:] = blurred_right
 
         # Apply contrast adjustment and overlay in a single operation
         if overlay_opacity > 0 or background_contrast != 1.0:

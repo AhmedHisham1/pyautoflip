@@ -47,21 +47,21 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "-a",
         "--aspect-ratio",
         default="9:16",
-        help="Target aspect ratio (width:height)",
+        help="Target aspect ratio (width:height). Default is '9:16'.",
     )
     reframe_parser.add_argument(
         "-m",
         "--motion-threshold",
         type=float,
         default=0.5,
-        help="Threshold for camera motion (0.0-1.0)",
+        help="Threshold for camera motion (0.0-1.0). Default is 0.5.",
     )
     reframe_parser.add_argument(
         "-p",
         "--padding-method",
         choices=["blur", "solid_color"],
         default="blur",
-        help="Method for padding when content cannot be fully included",
+        help="Method for padding when content cannot be fully included. Default is 'blur'.",
     )
     reframe_parser.add_argument(
         "-d",

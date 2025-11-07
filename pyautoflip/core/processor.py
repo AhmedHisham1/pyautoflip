@@ -178,6 +178,13 @@ class AutoFlipProcessor:
         logger.debug("Detecting scene boundaries...")
         start_time = time.time()
 
+        # skip scene detection for short videos (<30 seconds at 30fps)
+        duration_seconds = frame_count / 30  # assume 30fps
+        if duration_seconds < 30:
+            logger.debug(f"Video is short ({duration_seconds:.1f}s), skipping scene detection")
+            self.timing_info["shot_detection"] = time.time() - start_time
+            return [(0, frame_count)]
+
         try:
             shot_boundaries = self.shot_detector.detect(input_path)
 
@@ -298,13 +305,56 @@ class AutoFlipProcessor:
 
         return total_frames_processed
 
+    def _quick_talking_head_check(
+        self, video_reader: VideoReader, start_frame: int, scene_length: int
+    ) -> bool:
+        """
+        Quick check if scene is likely a talking head (face-only content).
+
+        Samples 3 frames and checks if faces are consistently present.
+        This allows us to skip expensive object detection.
+
+        Args:
+            video_reader: VideoReader object
+            start_frame: Start frame of the scene
+            scene_length: Length of the scene
+
+        Returns:
+            True if likely a talking head scene, False otherwise
+        """
+        # Sample just 3 frames (start, middle, end)
+        sample_indices = [0, scene_length // 2, scene_length - 1]
+        face_count = 0
+
+        for idx in sample_indices:
+            video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + idx)
+            ret, frame = video_reader.cap.read()
+            if ret:
+                # Use small frame for quick detection
+                small_frame = cv2.resize(frame, (320, 320))
+                try:
+                    faces = self.face_detector.detect(small_frame)
+                    if len(faces) > 0:
+                        face_count += 1
+                except Exception as e:
+                    logger.debug(f"Face detection failed in quick check: {e}")
+
+        # If 2 out of 3 frames have faces, likely talking head
+        is_talking_head = face_count >= 2
+        logger.debug(f"Quick talking head check: {face_count}/3 frames with faces -> {is_talking_head}")
+        return is_talking_head
+
     def _process_key_frames(
         self, video_reader: VideoReader, start_frame: int, scene_length: int
     ) -> Dict[str, Any]:
         """Sample and process key frames for content detection."""
         # Select key frame indices (sparse sampling)
         frame_count = scene_length
-        num_samples = min(15, max(3, frame_count // 30)) # approx 30fps: 1 sample per second; max 15 samples
+        # sample less frequently for longer scenes (>30s at 30fps)
+        if frame_count > 900:  # >30 seconds at 30fps
+            num_samples = min(10, max(3, frame_count // 60))  # 1 every 2 seconds
+        else:
+            num_samples = min(15, max(3, frame_count // 30))  # 1 every second
         relative_key_indices = sorted(
             [int(i) for i in np.linspace(0, frame_count - 1, num_samples)]
         )
@@ -314,6 +364,13 @@ class AutoFlipProcessor:
         logger.debug(
             f"Selected {len(key_frame_indices)} key frames for content detection"
         )
+
+        # quick check if this is a talking head scene
+        is_likely_talking_head = self._quick_talking_head_check(
+            video_reader, start_frame, scene_length
+        )
+        if is_likely_talking_head:
+            logger.debug("Detected talking head scene - skipping object detection")
 
         # Read only the key frames
         key_frames = {}
@@ -335,7 +392,8 @@ class AutoFlipProcessor:
             key_frames[key_idx - start_frame] = frame
 
             resized_frame = frame.copy()
-            resized_frame = cv2.resize(resized_frame, (640, 640))
+            # use 320x320 for faster detection
+            resized_frame = cv2.resize(resized_frame, (320, 320))
             # Detect faces
             try:
                 faces = self.face_detector.detect(resized_frame)
@@ -344,12 +402,16 @@ class AutoFlipProcessor:
                 logger.error(f"Face detection failed for frame {key_idx}: {e}")
                 face_detections[key_idx - start_frame] = []
 
-            # Detect objects
-            try:
-                objects = self.object_detector.detect(resized_frame)
-                object_detections[key_idx - start_frame] = objects
-            except Exception as e:
-                logger.error(f"Object detection failed for frame {key_idx}: {e}")
+            # detect objects (skip if talking head to save time)
+            if not is_likely_talking_head:
+                try:
+                    objects = self.object_detector.detect(resized_frame)
+                    object_detections[key_idx - start_frame] = objects
+                except Exception as e:
+                    logger.error(f"Object detection failed for frame {key_idx}: {e}")
+                    object_detections[key_idx - start_frame] = []
+            else:
+                # skip object detection for talking heads
                 object_detections[key_idx - start_frame] = []
 
         if not key_frames:
@@ -428,7 +490,9 @@ class AutoFlipProcessor:
                     batch_frames.append((frame, rel_crop_window))
                 
                 # Process batch in parallel
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count()-2 or 4)) as executor:
+                # use all available CPU cores
+                max_workers = os.cpu_count() or 4
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     cropped_batch = list(executor.map(
                         lambda x: cropper.apply_crop_window(x[0], x[1]),
                         batch_frames
