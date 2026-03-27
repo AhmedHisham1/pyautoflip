@@ -11,6 +11,7 @@ from pyautoflip.detection.shot_boundary import ShotBoundaryDetector
 from pyautoflip.detection.face_detector import FaceDetector
 from pyautoflip.detection.mediapipe_object_detector import ObjectDetector
 from pyautoflip.cropping.scene_cropper import SceneCropper
+from pyautoflip.cropping.saliency_cropper import SaliencyCropper
 from pyautoflip.utils.video import VideoReader, VideoWriter
 
 logger = logging.getLogger("autoflip")
@@ -38,6 +39,7 @@ class AutoFlipProcessor:
         motion_threshold: float = 0.5,
         padding_method: str = "blur",
         debug_mode: bool = False,
+        detection_method: str = "detection",
     ):
         """
         Initialize the AutoFlip processor.
@@ -47,21 +49,29 @@ class AutoFlipProcessor:
             motion_threshold: Threshold for camera motion (0.0-1.0)
             padding_method: Method for padding ("blur" or "solid_color")
             debug_mode: If True, draw debug visualizations
+            detection_method: "detection" for face/object detection pipeline,
+                            "saliency" for UNISAL saliency-based pipeline
         """
         self.target_aspect_ratio = self._parse_aspect_ratio(target_aspect_ratio)
+        self.target_aspect_ratio_str = target_aspect_ratio
         self.motion_threshold = motion_threshold
         self.padding_method = padding_method
         self.debug_mode = debug_mode
+        self.detection_method = detection_method
 
         logger.debug(
-            f"Initializing AutoFlipProcessor with target AR: {target_aspect_ratio}, motion threshold: {motion_threshold}"
+            f"Initializing AutoFlipProcessor with target AR: {target_aspect_ratio}, "
+            f"motion threshold: {motion_threshold}, method: {detection_method}"
         )
         logger.debug(f"Debug mode: {debug_mode}, Padding method: {padding_method}")
 
         # Initialize detectors
         self.shot_detector = ShotBoundaryDetector()
-        self.face_detector = FaceDetector()
-        self.object_detector = ObjectDetector()
+
+        if detection_method == "detection":
+            self.face_detector = FaceDetector()
+            self.object_detector = ObjectDetector()
+        # Saliency cropper is initialized lazily per scene
 
         # Directory for debug output
         self.debug_dir = "debug_frames"
@@ -118,9 +128,14 @@ class AutoFlipProcessor:
         scene_boundaries = self._detect_scenes(input_path, metadata["frame_count"])
 
         # Step 4: Process each scene
-        total_frames_processed = self._process_scenes(
-            scene_boundaries, video_reader, video_writer
-        )
+        if self.detection_method == "saliency":
+            total_frames_processed = self._process_scenes_saliency(
+                scene_boundaries, video_reader, video_writer
+            )
+        else:
+            total_frames_processed = self._process_scenes(
+                scene_boundaries, video_reader, video_writer
+            )
 
         # Step 5: Finalize output video
         output_path = video_writer.finalize()
@@ -303,6 +318,99 @@ class AutoFlipProcessor:
         self.timing_info["detection"] = total_detection_time
         self.timing_info["cropping"] = total_cropping_time
 
+        return total_frames_processed
+
+    def _process_scenes_saliency(
+        self,
+        scene_boundaries: List[Tuple[int, int]],
+        video_reader: VideoReader,
+        video_writer: VideoWriter,
+    ) -> int:
+        """Process scenes using the saliency-based pipeline."""
+        total_detection_time = 0
+        total_cropping_time = 0
+        total_frames_processed = 0
+
+        saliency_cropper = SaliencyCropper(
+            target_aspect_ratio=self.target_aspect_ratio,
+            motion_threshold=self.motion_threshold,
+            padding_method=self.padding_method,
+        )
+
+        max_workers = os.cpu_count() or 4
+
+        for scene_idx, (start_frame, end_frame) in tqdm(
+            enumerate(scene_boundaries),
+            total=len(scene_boundaries),
+            desc="Processing scenes",
+        ):
+            scene_length = end_frame - start_frame
+
+            # Sample key frames for this scene
+            detection_start = time.time()
+            n_samples = min(scene_length, saliency_cropper.max_frames_per_scene)
+            sample_indices = sorted(
+                [int(i) for i in np.linspace(0, scene_length - 1, max(2, n_samples))]
+            )
+
+            key_frames = []
+            for idx in sample_indices:
+                video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + idx)
+                ret, frame = video_reader.cap.read()
+                if ret:
+                    key_frames.append(frame)
+
+            if not key_frames:
+                continue
+
+            # Process scene to get crop windows
+            rel_crop_windows = saliency_cropper.process_scene(key_frames, scene_length)
+            detection_time = time.time() - detection_start
+            total_detection_time += detection_time
+
+            if not rel_crop_windows:
+                continue
+
+            # Apply crops to all frames
+            cropping_start = time.time()
+            video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            batch_size = 60
+            current_frame = 0
+
+            while current_frame < scene_length:
+                batch_end = min(current_frame + batch_size, scene_length)
+                batch_frames = []
+
+                for i in range(current_frame, batch_end):
+                    ret, frame = video_reader.cap.read()
+                    if not ret:
+                        continue
+                    batch_frames.append((frame, rel_crop_windows[i]))
+
+                if saliency_cropper.needs_split_screen():
+                    for frame, _ in batch_frames:
+                        result = saliency_cropper.apply_split_screen(frame)
+                        if result is None:
+                            result = saliency_cropper.apply_crop_window(frame, rel_crop_windows[current_frame])
+                        video_writer.write_frame(result)
+                        total_frames_processed += 1
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        cropped_batch = list(executor.map(
+                            lambda x: saliency_cropper.apply_crop_window(x[0], x[1]),
+                            batch_frames
+                        ))
+                    for cropped_frame in cropped_batch:
+                        video_writer.write_frame(cropped_frame)
+                        total_frames_processed += 1
+
+                current_frame = batch_end
+
+            total_cropping_time += time.time() - cropping_start
+
+        self.timing_info["detection"] = total_detection_time
+        self.timing_info["cropping"] = total_cropping_time
         return total_frames_processed
 
     def _quick_talking_head_check(
