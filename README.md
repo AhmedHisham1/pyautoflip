@@ -8,6 +8,22 @@ A Python library for saliency-aware video cropping that automatically reframes v
 
 PyAutoFlip analyzes videos to identify salient content (faces, objects, motion) and intelligently crops frames to fit target aspect ratios. This is useful for adapting content between different platforms (e.g., landscape videos for portrait social media formats).
 
+### Examples
+
+Landscape to 9:16 — the saliency method automatically tracks the most important region:
+
+![Example 1](assets/example1.jpg)
+
+When two people are too far apart for a single crop, it automatically creates a split-screen layout:
+
+![Split-screen example 1](assets/example_split1.jpg)
+
+![Split-screen example 2](assets/example_split2.jpg)
+
+Handles multi-person scenes by focusing on the salient subject:
+
+![Example 2](assets/example2.jpg)
+
 ## Installation
 
 ```bash
