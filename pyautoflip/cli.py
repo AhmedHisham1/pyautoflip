@@ -69,6 +69,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Enable debug mode: shows visualization, saves debug frames, provides comprehensive debug information, sets log level to DEBUG, and saves logs to autoflip.log",
     )
+    reframe_parser.add_argument(
+        "--method",
+        choices=["detection", "saliency"],
+        default="detection",
+        help="Detection method: 'detection' (face/object detection) or 'saliency' (UNISAL saliency maps). Default is 'detection'.",
+    )
 
     parsed_args = parser.parse_args(args)
 
@@ -110,6 +116,7 @@ def main(args: Optional[List[str]] = None) -> int:
                 motion_threshold=parsed_args.motion_threshold,
                 padding_method=parsed_args.padding_method,
                 debug_mode=parsed_args.debug,
+                detection_method=parsed_args.method,
                 log_level=log_level,
                 log_file=log_file,
             )

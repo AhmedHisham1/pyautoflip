@@ -75,6 +75,7 @@ def reframe_video(
     motion_threshold: float = 0.5,
     padding_method: str = "blur",
     debug_mode: bool = False,
+    detection_method: str = "detection",
     log_level: Union[int, str] = "INFO",
     log_file: Optional[str] = None,
 ) -> str:
@@ -88,6 +89,8 @@ def reframe_video(
         motion_threshold: Threshold for camera motion (0.0-1.0)
         padding_method: Method for padding ("blur" or "solid_color")
         debug_mode: If True, enables visualization, debug frames, and debug mode processing
+        detection_method: "detection" for face/object detection pipeline,
+                         "saliency" for UNISAL saliency-based pipeline
         log_level: Logging level (use LogLevel enum values or string names like 'INFO', 'DEBUG')
         log_file: Path to save logs to a file (None to log to console only)
 
@@ -102,6 +105,7 @@ def reframe_video(
         motion_threshold=motion_threshold,
         padding_method=padding_method,
         debug_mode=debug_mode,
+        detection_method=detection_method,
     )
 
     return processor.process_video(

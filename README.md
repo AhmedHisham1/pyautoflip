@@ -8,6 +8,22 @@ A Python library for saliency-aware video cropping that automatically reframes v
 
 PyAutoFlip analyzes videos to identify salient content (faces, objects, motion) and intelligently crops frames to fit target aspect ratios. This is useful for adapting content between different platforms (e.g., landscape videos for portrait social media formats).
 
+### Examples
+
+Landscape to 9:16 — the saliency method automatically tracks the most important region:
+
+![Example 1](assets/example1.jpg)
+
+When two people are too far apart for a single crop, it automatically creates a split-screen layout:
+
+![Split-screen example 1](assets/example_split1.jpg)
+
+![Split-screen example 2](assets/example_split2.jpg)
+
+Handles multi-person scenes by focusing on the salient subject:
+
+![Example 2](assets/example2.jpg)
+
 ## Installation
 
 ```bash
@@ -20,8 +36,11 @@ pip install pyautoflip
 ### Command Line
 
 ```bash
-# Convert a landscape video to portrait (9:16) 
+# Convert a landscape video to portrait (9:16)
 pyautoflip reframe -i input.mp4 -o output.mp4
+
+# Use saliency-based detection (UNISAL + face detection)
+pyautoflip reframe -i input.mp4 -o output.mp4 --method saliency
 
 # Convert to square format
 pyautoflip reframe -i input.mp4 -o output.mp4 --aspect-ratio 1:1
@@ -35,11 +54,19 @@ pyautoflip reframe -i input.mp4 -o output.mp4 --debug
 ```python
 from pyautoflip import reframe_video
 
-# Basic usage
+# Basic usage (detection method - face/object detection)
 reframe_video(
     input_path="input.mp4",
-    output_path="output.mp4", 
+    output_path="output.mp4",
     target_aspect_ratio="9:16"
+)
+
+# Saliency-based method (better for complex content)
+reframe_video(
+    input_path="input.mp4",
+    output_path="output.mp4",
+    target_aspect_ratio="9:16",
+    detection_method="saliency"
 )
 
 # With options
@@ -49,23 +76,50 @@ reframe_video(
     target_aspect_ratio="1:1",
     motion_threshold=0.3,        # Lower = more stable crops
     padding_method="blur",       # or "solid_color"
+    detection_method="saliency",
     debug_mode=True
 )
 ```
 
+## Detection Methods
+
+PyAutoFlip supports two detection methods for determining what to keep in frame:
+
+### `detection` (default)
+
+Uses InsightFace for face detection and MediaPipe for object detection. Fast and reliable for content with clear subjects (people, animals, text). Assigns priority weights to different object types (faces > people > animals > text).
+
+### `saliency`
+
+Uses [UNISAL](https://github.com/rdroste/unisal) saliency maps combined with InsightFace face detection. Better for complex scenes where important content isn't just faces/objects. Features:
+
+- **UNISAL saliency**: Learns what draws human visual attention from data, via ONNX Runtime for fast CPU inference
+- **Face-aware**: Combines saliency with face detection, filters out false faces (portraits, posters) by size
+- **Adaptive crop width**: Uses narrow (exact AR) or wide (+30% with blur padding) crop per scene based on saliency spread
+- **Split-screen**: Automatically detects when two faces are too far apart for one crop (e.g., podcast wide shots) and renders a 2-panel split layout
+- **Temporal stabilization**: Per-scene camera motion classification (stationary/panning/tracking) with trajectory smoothing
+
 ## How it works
 
-1. **Scene Detection**: Identifies scene boundaries in the video
-2. **Content Analysis**: Detects faces (InsightFace) and objects (MediaPipe) 
-3. **Saliency-aware Cropping**: Determines optimal crop regions based on detected content
-4. **Temporal Smoothing**: Applies smooth camera motion or stable crops as appropriate
+1. **Scene Detection**: Identifies scene boundaries using PySceneDetect
+2. **Content Analysis**: Samples key frames per scene and runs detection
+   - *Detection method*: InsightFace faces + MediaPipe objects with priority weights
+   - *Saliency method*: UNISAL saliency maps + InsightFace faces (size-filtered) on downscaled frames
+3. **Crop Computation**: Determines optimal crop regions per frame
+   - Fixed-width crop windows centered on the saliency center of mass
+   - Per-scene crop width decision (narrow vs wide with padding)
+4. **Temporal Smoothing**: Camera motion classification (STATIONARY/PANNING/TRACKING) with appropriate stabilization per scene
+5. **Output**: Applies crops with blur/solid padding and recombines with original audio
 
 ## Options
 
-- `--aspect-ratio`: Target aspect ratio (e.g., "9:16", "1:1", "4:3")
-- `--motion-threshold`: Camera motion sensitivity (0.0 = very stable, 1.0 = allow more motion)
-- `--padding-method`: How to handle content that doesn't fit ("blur" or "solid_color")
-- `--debug`: Enable debug mode with visualizations and detailed logging
+| Option | Description | Default |
+|---|---|---|
+| `--aspect-ratio` | Target aspect ratio (e.g., "9:16", "1:1", "4:3") | `9:16` |
+| `--method` | Detection method: `detection` or `saliency` | `detection` |
+| `--motion-threshold` | Camera motion sensitivity (0.0 = stable, 1.0 = allow motion) | `0.5` |
+| `--padding-method` | Padding style: `blur` or `solid_color` | `blur` |
+| `--debug` | Enable debug mode with visualizations and logging | off |
 
 ## Requirements
 
@@ -99,6 +153,8 @@ MIT License - see LICENSE file for details.
 ## Acknowledgments
 
 - [MediaPipe AutoFlip](https://github.com/google-ai-edge/mediapipe/blob/master/docs/solutions/autoflip.md) for the original concept and methodology
+- [UNISAL](https://github.com/rdroste/unisal) for the saliency detection model
 - [InsightFace](https://github.com/deepinsight/insightface) for face detection
 - [MediaPipe](https://github.com/google/mediapipe) for object detection
 - [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) for scene analysis
+- [ONNX Runtime](https://onnxruntime.ai/) for fast CPU inference
