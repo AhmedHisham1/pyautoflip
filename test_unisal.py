@@ -45,9 +45,14 @@ def detect_scenes(video_path: str):
 # ─── Frame Loading ────────────────────────────────────────────────────────────
 
 
+PROCESSING_WIDTH = 640  # Width for saliency/face processing (models resize internally anyway)
+
+
 def load_scene_frames(video_path: str, scenes: list, max_per_scene: int = 16):
+    """Load frames at two resolutions: small for processing, full for display."""
     cap = cv2.VideoCapture(video_path)
-    all_frames, all_indices, scene_labels = [], [], []
+    all_frames_full, all_frames_small = [], []
+    all_indices, scene_labels = [], []
 
     for scene_idx, (start, end) in enumerate(scenes):
         scene_len = end - start
@@ -58,13 +63,24 @@ def load_scene_frames(video_path: str, scenes: list, max_per_scene: int = 16):
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if ret:
-                all_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                all_frames_full.append(rgb)
+                # Downscale for processing
+                h, w = rgb.shape[:2]
+                if w > PROCESSING_WIDTH:
+                    scale = PROCESSING_WIDTH / w
+                    small = cv2.resize(rgb, (PROCESSING_WIDTH, int(h * scale)))
+                else:
+                    small = rgb
+                all_frames_small.append(small)
                 all_indices.append(idx)
                 scene_labels.append(scene_idx)
 
     cap.release()
-    print(f"Loaded {len(all_frames)} frames across {len(scenes)} scenes")
-    return all_frames, all_indices, scene_labels
+    h_full, w_full = all_frames_full[0].shape[:2]
+    h_small, w_small = all_frames_small[0].shape[:2]
+    print(f"Loaded {len(all_frames_full)} frames across {len(scenes)} scenes ({w_full}x{h_full} → {w_small}x{h_small} for processing)")
+    return all_frames_full, all_frames_small, all_indices, scene_labels
 
 
 # ─── UNISAL Saliency Processing ──────────────────────────────────────────────
@@ -92,7 +108,7 @@ def compute_saliency_maps(frames):
 
 # ─── Face Detection (MediaPipe BlazeFace) ─────────────────────────────────────
 
-from pyautoflip.detection.mediapipe_face_detector import FaceDetector as MPFaceDetector
+from pyautoflip.detection.face_detector import FaceDetector as InsightFaceDetector
 
 _face_detector = None
 FACE_WEIGHT = 2.0
@@ -101,23 +117,43 @@ FACE_WEIGHT = 2.0
 def _get_face_detector():
     global _face_detector
     if _face_detector is None:
-        _face_detector = MPFaceDetector()
+        _face_detector = InsightFaceDetector()
     return _face_detector
 
 
-def detect_faces_mp(frame_bgr):
-    """Detect faces using MediaPipe BlazeFace. Returns list of (x,y,w,h) in pixels."""
+def detect_faces(frame_bgr, saliency_map=None, min_face_fraction=0.03):
+    """
+    Detect faces using InsightFace. Returns list of (x,y,w,h) in pixels.
+    Filters out small faces (< min_face_fraction of frame area) which are
+    typically portraits, posters, or photos on walls — not real people.
+    """
     detector = _get_face_detector()
     h, w = frame_bgr.shape[:2]
+    frame_area = h * w
     detections = detector.detect(frame_bgr)
-    rects = []
+
+    # First pass: collect all faces with their areas
+    candidates = []
     for d in detections:
-        rects.append((
-            int(d["x"] * w),
-            int(d["y"] * h),
-            int(d["width"] * w),
-            int(d["height"] * h),
-        ))
+        fx = int(d["x"] * w)
+        fy = int(d["y"] * h)
+        fw = int(d["width"] * w)
+        fh = int(d["height"] * h)
+        face_area = fw * fh
+        candidates.append((fx, fy, fw, fh, face_area))
+
+    if not candidates:
+        return []
+
+    # Filter: keep faces that are at least min_face_fraction of the frame,
+    # OR at least 30% the size of the largest face (relative filter)
+    max_area = max(c[4] for c in candidates)
+    rects = []
+    for fx, fy, fw, fh, face_area in candidates:
+        if face_area < frame_area * min_face_fraction and face_area < max_area * 0.3:
+            continue  # too small — likely a portrait/poster
+        rects.append((fx, fy, fw, fh))
+
     return rects
 
 
@@ -272,18 +308,101 @@ def apply_padding_to_crop(frame_bgr, crop, target_aspect, method="blur"):
             return canvas
 
 
+# ─── Split-Screen for Multi-Peak Saliency ─────────────────────────────────────
+
+
+def find_split_faces(face_rects, frame_w, frame_h, target_aspect):
+    """
+    Check if 2+ faces are too far apart to fit in one crop.
+    Returns the 2 most separated faces as [(cx, cy), ...] normalized 0-1, or None.
+    """
+    if face_rects is None or len(face_rects) < 2:
+        return None
+
+    crop_w = int(frame_h * target_aspect[0] / target_aspect[1])
+    crop_w_norm = crop_w / frame_w
+
+    # Build (cx, cy) for each face, sort by x
+    face_centers = sorted(
+        [((fx + fw / 2) / frame_w, (fy + fh / 2) / frame_h) for (fx, fy, fw, fh) in face_rects],
+        key=lambda c: c[0]
+    )
+    left, right = face_centers[0], face_centers[-1]
+
+    if right[0] - left[0] > crop_w_norm:
+        return [left, right]
+
+    return None
+
+
+def render_split_screen(display, face_rects, target_aspect):
+    """
+    Render a 2-panel split-screen 9:16 frame, each panel centered on a face.
+    Each panel has the correct sub-aspect ratio (9:8) so they stack to form 9:16.
+    """
+    h, w = display.shape[:2]
+    aspect_w, aspect_h = target_aspect
+    target_ratio = aspect_w / aspect_h
+
+    chosen = find_split_faces(face_rects, w, h, target_aspect)
+    if chosen is None:
+        return None
+
+    n = 2
+
+    # Output dimensions
+    out_w = int(h * target_ratio)
+    out_h = h
+
+    divider_h = 4
+    usable_h = out_h - divider_h * (n - 1)
+    panel_h = usable_h // n
+
+    # Each panel's aspect ratio in the output
+    panel_ratio = out_w / panel_h  # e.g., 9:8 for 2 panels
+
+    # Source crop dimensions: use the 9:16 width as source width for each panel,
+    # then compute height from the panel AR. This keeps each person tightly framed.
+    src_crop_w = int(h * target_ratio)  # same as the normal 9:16 crop width
+    src_crop_h = int(src_crop_w / panel_ratio)
+    src_crop_h = min(src_crop_h, h)
+    src_crop_w = min(src_crop_w, w)
+
+    canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    y_cursor = 0
+
+    for i, (cx_norm, cy_norm) in enumerate(chosen):
+        cx_px = int(cx_norm * w)
+        cy_px = int(cy_norm * h)
+        crop_x = max(0, min(cx_px - src_crop_w // 2, w - src_crop_w))
+        # Center vertically on the face
+        src_crop_y = max(0, min(cy_px - src_crop_h // 2, h - src_crop_h))
+
+        strip = display[src_crop_y:src_crop_y + src_crop_h, crop_x:crop_x + src_crop_w]
+
+        panel = cv2.resize(strip, (out_w, panel_h), interpolation=cv2.INTER_LANCZOS4)
+        canvas[y_cursor:y_cursor + panel_h, :] = panel
+        y_cursor += panel_h
+
+        if i < n - 1:
+            canvas[y_cursor:y_cursor + divider_h, :] = (40, 40, 40)
+            y_cursor += divider_h
+
+    return canvas
+
+
 # ─── Temporal Smoothing ───────────────────────────────────────────────────────
 
 
 def detect_all_faces(frames):
-    """Run face detection on all frames upfront. Returns list of face_rects per frame."""
-    print("Detecting faces (MediaPipe BlazeFace)...")
+    """Run face detection on all frames, filtering out small faces. Returns list of face_rects per frame."""
+    print("Detecting faces (InsightFace, size-filtered)...")
     all_faces = []
     for frame in tqdm(frames, desc="Face detection"):
         if not isinstance(frame, np.ndarray):
             frame = np.array(frame)
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        faces = detect_faces_mp(bgr)
+        faces = detect_faces(bgr)
         all_faces.append(faces)
     n_with_faces = sum(1 for f in all_faces if len(f) > 0)
     print(f"Faces found in {n_with_faces}/{len(frames)} frames")
@@ -383,7 +502,8 @@ VIEW_CROP_RAW = 2
 VIEW_CROP_SMOOTH = 3
 VIEW_RESULT_CROP = 4
 VIEW_RESULT_PADDED = 5
-VIEW_NAMES = ["Saliency", "Saliency + BBox", "Crop (raw)", "Crop (smoothed)", "Cropped (no pad)", "Cropped (blur pad)"]
+VIEW_SPLIT_SCREEN = 6
+VIEW_NAMES = ["Saliency", "Saliency + BBox", "Crop (raw)", "Crop (smoothed)", "Cropped (no pad)", "Cropped (blur pad)", "Split-screen"]
 
 
 def letterbox(img, canvas_w, canvas_h):
@@ -426,20 +546,34 @@ def draw_crop_overlay(display, composite, bbox, com, crop, h, w, color, face_rec
     return overlay
 
 
-def visualize(frames, saliency_maps, sample_indices, scene_labels, total_frames, fps):
-    num_frames = len(frames)
+def scale_rects(rects, from_w, from_h, to_w, to_h):
+    """Scale pixel rects from one resolution to another."""
+    sx, sy = to_w / from_w, to_h / from_h
+    return [(int(x*sx), int(y*sy), int(w*sx), int(h*sy)) for (x, y, w, h) in rects]
+
+
+def scale_crop(crop, from_w, from_h, to_w, to_h):
+    """Scale a crop window from one resolution to another."""
+    sx, sy = to_w / from_w, to_h / from_h
+    cx, cy, cw, ch = crop
+    return (int(cx*sx), int(cy*sy), int(cw*sx), int(ch*sy))
+
+
+def visualize(frames_full, frames_small, saliency_maps, sample_indices, scene_labels, total_frames, fps):
+    num_frames = len(frames_full)
     num_scenes = len(set(scene_labels))
+    h_small, w_small = frames_small[0].shape[:2]
 
     print(f"\nFrames: {num_frames}, Scenes: {num_scenes}")
     print(f"Target aspect ratio: {TARGET_ASPECT[0]}:{TARGET_ASPECT[1]}")
 
-    # Detect faces on all frames
-    all_faces = detect_all_faces(frames)
+    # Detect faces on small frames (faster)
+    all_faces_small = detect_all_faces(frames_small)
 
-    # Pre-compute smoothed crops
+    # Pre-compute smoothed crops on small frames
     print("Smoothing crop trajectories...")
     raw_bboxes, raw_coms, raw_crops, smoothed_coms, smoothed_crops = smooth_scene_crops(
-        frames, saliency_maps, scene_labels, TARGET_ASPECT, all_faces
+        frames_small, saliency_maps, scene_labels, TARGET_ASPECT, all_faces_small
     )
 
     print("\nControls: [Space] pause | [N/P] next/prev | [V] cycle view | [Q] quit")
@@ -450,33 +584,39 @@ def visualize(frames, saliency_maps, sample_indices, scene_labels, total_frames,
     paused = True
 
     while True:
-        frame = frames[frame_idx]
-        if not isinstance(frame, np.ndarray):
-            frame = np.array(frame)
-        h, w = frame.shape[:2]
-        display = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # Full-res frame for display
+        frame_full = frames_full[frame_idx]
+        if not isinstance(frame_full, np.ndarray):
+            frame_full = np.array(frame_full)
+        h, w = frame_full.shape[:2]
+        display = cv2.cvtColor(frame_full, cv2.COLOR_RGB2BGR)
 
-        face_rects = all_faces[frame_idx]
-        composite = get_composite_mask(saliency_maps[frame_idx], face_rects)
-        display_composite = np.clip(composite, 0, 1)
+        # Scale face rects and crops from small to full res
+        face_rects = scale_rects(all_faces_small[frame_idx], w_small, h_small, w, h)
+        crop_raw = scale_crop(raw_crops[frame_idx], w_small, h_small, w, h)
+        crop_smooth = scale_crop(smoothed_crops[frame_idx], w_small, h_small, w, h)
+
+        # Saliency composite upscaled for overlay
+        sal_map = saliency_maps[frame_idx]
+        composite_small = get_composite_mask(sal_map, all_faces_small[frame_idx])
+        composite = cv2.resize(np.clip(composite_small, 0, 1), (w, h), interpolation=cv2.INTER_LINEAR)
+
         bbox = raw_bboxes[frame_idx]
         com_raw = raw_coms[frame_idx]
         com_smooth = smoothed_coms[frame_idx]
-        crop_raw = raw_crops[frame_idx]
-        crop_smooth = smoothed_crops[frame_idx]
-        n_faces = len(face_rects) if face_rects is not None and len(face_rects) > 0 else 0
+        n_faces = len(face_rects)
 
         # ── Render based on view mode ──
         if view_mode == VIEW_SALIENCY:
-            alpha = 0.3 + 0.7 * display_composite
+            alpha = 0.3 + 0.7 * composite
             overlay = (display * alpha[:, :, None]).astype(np.uint8)
-            for (fx, fy, fw, fh) in (face_rects if n_faces else []):
+            for (fx, fy, fw, fh) in face_rects:
                 cv2.rectangle(overlay, (fx, fy), (fx+fw, fy+fh), (255, 255, 0), 2)
 
         elif view_mode == VIEW_BBOX:
-            alpha = 0.3 + 0.7 * display_composite
+            alpha = 0.3 + 0.7 * composite
             overlay = (display * alpha[:, :, None]).astype(np.uint8)
-            for (fx, fy, fw, fh) in (face_rects if n_faces else []):
+            for (fx, fy, fw, fh) in face_rects:
                 cv2.rectangle(overlay, (fx, fy), (fx+fw, fy+fh), (255, 255, 0), 2)
             bx, by, bw, bh = int(bbox[0]*w), int(bbox[1]*h), int(bbox[2]*w), int(bbox[3]*h)
             cv2.rectangle(overlay, (bx, by), (bx+bw, by+bh), (0, 255, 255), 2)
@@ -500,6 +640,14 @@ def visualize(frames, saliency_maps, sample_indices, scene_labels, total_frames,
         elif view_mode == VIEW_RESULT_PADDED:
             padded = apply_padding_to_crop(display, crop_smooth, TARGET_ASPECT, method="blur")
             overlay = letterbox(padded, w, h)
+
+        elif view_mode == VIEW_SPLIT_SCREEN:
+            split = render_split_screen(display, face_rects, TARGET_ASPECT)
+            if split is not None:
+                overlay = letterbox(split, w, h)
+            else:
+                padded = apply_padding_to_crop(display, crop_smooth, TARGET_ASPECT, method="blur")
+                overlay = letterbox(padded, w, h)
 
         # ── HUD ──
         vid_frame = sample_indices[frame_idx]
@@ -548,23 +696,28 @@ def visualize(frames, saliency_maps, sample_indices, scene_labels, total_frames,
 
 
 def main():
-    video_path = "test.mp4"
+    import argparse
+    parser = argparse.ArgumentParser(description="UNISAL saliency reframing test")
+    parser.add_argument("video", nargs="?", default="test.mp4", help="Path to input video")
+    args = parser.parse_args()
+
+    video_path = args.video
     assert Path(video_path).exists(), f"Video not found: {video_path}"
 
     # Detect scenes
     print(f"Detecting scenes in: {video_path}")
     scenes, total_frames, fps = detect_scenes(video_path)
 
-    # Load sampled frames per scene
-    frames, indices, scene_labels = load_scene_frames(
-        video_path, scenes, max_per_scene=16
+    # Load sampled frames per scene (full + small for processing)
+    frames_full, frames_small, indices, scene_labels = load_scene_frames(
+        video_path, scenes, max_per_scene=5
     )
 
-    # Compute saliency maps with UNISAL
-    saliency_maps = compute_saliency_maps(frames)
+    # Compute saliency maps on small frames
+    saliency_maps = compute_saliency_maps(frames_small)
 
-    # Visualize step by step
-    visualize(frames, saliency_maps, indices, scene_labels, total_frames, fps)
+    # Visualize using full frames for display, small frames for processing
+    visualize(frames_full, frames_small, saliency_maps, indices, scene_labels, total_frames, fps)
 
 
 if __name__ == "__main__":
