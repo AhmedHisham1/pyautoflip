@@ -1,6 +1,6 @@
 [project]
 name = "pyautoflip"
-version = "0.1.1"
+version = "0.2.0"
 description = "Intelligent video reframing library that automatically crops videos to different aspect ratios while preserving important content"
 authors = [
     {name = "Ahmed Hisham", email = "a7med.hish@gmail.com"}

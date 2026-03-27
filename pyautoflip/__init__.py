@@ -5,7 +5,7 @@ A Python library for automatic video reframing that intelligently crops videos
 to different aspect ratios while preserving salient content.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 import logging
 from typing import Optional, Union
