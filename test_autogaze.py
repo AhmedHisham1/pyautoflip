@@ -607,7 +607,12 @@ def visualize(frames, gaze_outputs, sample_indices, scene_labels, total_frames, 
 
 
 def main():
-    video_path = "test.mp4"
+    import argparse
+    parser = argparse.ArgumentParser(description="AutoGaze saliency reframing test")
+    parser.add_argument("video", nargs="?", default="test.mp4", help="Path to input video")
+    args = parser.parse_args()
+
+    video_path = args.video
     assert Path(video_path).exists(), f"Video not found: {video_path}"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
