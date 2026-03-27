@@ -36,6 +36,13 @@ dependencies = [
     "onnxruntime>=1.21.0",
     "mediapipe>=0.10.21",
     "autogaze @ git+https://github.com/NVlabs/AutoGaze.git",
+    "tensorboardx>=2.6.4",
+    "tensorboard>=2.20.0",
+    "torchvision>=0.26.0",
+    "torch>=2.11.0",
+    "scipy>=1.15.3",
+    "scikit-image>=0.25.2",
+    "matplotlib>=3.10.7",
 ]
 
 [project.scripts]
