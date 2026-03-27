@@ -1,6 +1,6 @@
 [project]
 name = "pyautoflip"
-version = "0.2.0"
+version = "0.2.1"
 description = "Intelligent video reframing library that automatically crops videos to different aspect ratios while preserving important content"
 authors = [
     {name = "Ahmed Hisham", email = "a7med.hish@gmail.com"}
@@ -35,7 +35,6 @@ dependencies = [
     "insightface>=0.7.3",
     "onnxruntime>=1.21.0",
     "mediapipe>=0.10.21",
-    "autogaze @ git+https://github.com/NVlabs/AutoGaze.git",
     "tensorboardx>=2.6.4",
     "tensorboard>=2.20.0",
     "torchvision>=0.26.0",
@@ -69,9 +68,6 @@ override-dependencies = ["flash-attn ; sys_platform == 'never'"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["pyautoflip"]
