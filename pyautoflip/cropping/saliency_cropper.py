@@ -12,12 +12,14 @@ import cv2
 import numpy as np
 
 from pyautoflip.cropping.camera_motion import CameraMotionHandler
+from pyautoflip.cropping.padding_effects import PaddingEffectGenerator
 
 logger = logging.getLogger("autoflip.cropping.saliency_cropper")
 
 FACE_WEIGHT = 2.0       # Saliency boost for face regions
 WIDE_CROP_FACTOR = 1.30  # 30% wider crop when saliency exceeds 9:16 strip
 PROCESSING_WIDTH = 640    # Downscale width for saliency/face processing
+_PADDING_GENERATOR = PaddingEffectGenerator()
 
 
 class SaliencyCropper:
@@ -372,6 +374,22 @@ def _make_even(n):
     return n - (n % 2)
 
 
+def _target_dimensions_for_frame(frame_w, frame_h, target_aspect):
+    """Compute the output frame size for a target aspect ratio."""
+    aspect_w, aspect_h = target_aspect
+    target_ratio = aspect_w / aspect_h
+    source_ratio = frame_w / frame_h
+
+    if target_ratio > source_ratio:
+        target_w = frame_w
+        target_h = int(frame_w / target_ratio)
+    else:
+        target_h = frame_h
+        target_w = int(frame_h * target_ratio)
+
+    return max(2, _make_even(target_w)), max(2, _make_even(target_h))
+
+
 def compute_scene_crop_width(scene_bboxes, frame_w, frame_h, target_aspect):
     """
     Compute fixed crop width for a scene (always even).
@@ -391,10 +409,12 @@ def compute_scene_crop_width(scene_bboxes, frame_w, frame_h, target_aspect):
 def apply_padding_to_crop(frame_bgr, crop, target_aspect, method="blur"):
     """
     Extract crop region and apply padding to fit target aspect ratio.
-    Optimized: stretches the crop to fill the output and darkens the padding
-    bars in-place — no extra resizes needed.
+    Wide saliency crops are fit inside the target frame with real padding;
+    the padding is not painted over the crop content.
     """
     cx, cy, cw, ch = crop
+    frame_h, frame_w = frame_bgr.shape[:2]
+    target_w, target_h = _target_dimensions_for_frame(frame_w, frame_h, target_aspect)
     crop_region = frame_bgr[cy:cy+ch, cx:cx+cw]
 
     aspect_w, aspect_h = target_aspect
@@ -402,31 +422,25 @@ def apply_padding_to_crop(frame_bgr, crop, target_aspect, method="blur"):
     content_ratio = cw / ch
 
     if abs(content_ratio - target_ratio) < 0.01:
-        eh, ew = _make_even(crop_region.shape[0]), _make_even(crop_region.shape[1])
-        return crop_region[:eh, :ew]
+        if crop_region.shape[:2] == (target_h, target_w):
+            return crop_region
+        return cv2.resize(
+            crop_region, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+        )
 
-    out_w = _make_even(cw)
-    out_h = _make_even(int(out_w / target_ratio))
-
-    # Stretch the crop to fill the full output — fast single resize
-    canvas = cv2.resize(crop_region, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-    if content_ratio > target_ratio:
-        # Wider than target → darken top/bottom padding bars
-        fg_h = int(out_w * ch / cw)
-        pad_y = (out_h - fg_h) // 2
-        if pad_y > 0:
-            canvas[:pad_y] = (canvas[:pad_y] * 0.15).astype(np.uint8)
-            canvas[pad_y + fg_h:] = (canvas[pad_y + fg_h:] * 0.15).astype(np.uint8)
-    else:
-        # Taller than target → darken left/right padding bars
-        fg_w = int(out_h * cw / ch)
-        pad_x = (out_w - fg_w) // 2
-        if pad_x > 0:
-            canvas[:, :pad_x] = (canvas[:, :pad_x] * 0.15).astype(np.uint8)
-            canvas[:, pad_x + fg_w:] = (canvas[:, pad_x + fg_w:] * 0.15).astype(np.uint8)
-
-    return canvas
+    return _PADDING_GENERATOR.apply_padding(
+        frame=frame_bgr,
+        crop_region=crop_region,
+        x=cx,
+        y=cy,
+        crop_width=cw,
+        crop_height=ch,
+        target_width=target_w,
+        target_height=target_h,
+        padding_method=method,
+        overlay_opacity=0.0,
+        background_contrast=1.0,
+    )
 
 
 def find_split_faces(face_rects, frame_w, frame_h, target_aspect):
