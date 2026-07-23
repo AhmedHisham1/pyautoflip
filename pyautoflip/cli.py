@@ -7,7 +7,7 @@ import argparse
 import sys
 from typing import List, Optional
 
-from pyautoflip import reframe_video, __version__
+from pyautoflip import reframe_video, analyze_video, __version__
 
 
 def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
@@ -76,6 +76,53 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Detection method: 'detection' (face/object detection) or 'saliency' (UNISAL saliency maps). Default is 'detection'.",
     )
 
+    # Analyze command (dry-run: compute crop windows without producing video)
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="Analyze a video and output crop window data (no video output)"
+    )
+    analyze_parser.add_argument(
+        "-i", "--input", required=True, help="Path to the input video file"
+    )
+    analyze_parser.add_argument(
+        "-o", "--output", required=True, help="Path to save the crop analysis JSON"
+    )
+    analyze_parser.add_argument(
+        "-a",
+        "--aspect-ratio",
+        default="9:16",
+        help="Target aspect ratio (width:height). Default is '9:16'.",
+    )
+    analyze_parser.add_argument(
+        "--start-time",
+        type=float,
+        default=None,
+        help="Start time in seconds (analyze a subrange).",
+    )
+    analyze_parser.add_argument(
+        "--end-time",
+        type=float,
+        default=None,
+        help="End time in seconds.",
+    )
+    analyze_parser.add_argument(
+        "--sample-fps",
+        type=float,
+        default=5.0,
+        help="Sampling FPS for dense crop windows. Default is 5.0.",
+    )
+    analyze_parser.add_argument(
+        "--method",
+        choices=["detection", "saliency"],
+        default="detection",
+        help="Detection method. Default is 'detection'.",
+    )
+    analyze_parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug mode.",
+    )
+
     parsed_args = parser.parse_args(args)
 
     if not parsed_args.command:
@@ -123,6 +170,38 @@ def main(args: Optional[List[str]] = None) -> int:
 
             print(f"✅ Video reframing completed: {output_path}")
             return 0
+
+        elif parsed_args.command == "analyze":
+            # Set log level based on debug mode
+            log_level = "DEBUG" if parsed_args.debug else "INFO"
+            log_file = "autoflip.log" if parsed_args.debug else None
+
+            # Analyze the video (dry-run)
+            analysis = analyze_video(
+                input_path=parsed_args.input,
+                target_aspect_ratio=parsed_args.aspect_ratio,
+                detection_method=parsed_args.method,
+                start_time=parsed_args.start_time,
+                end_time=parsed_args.end_time,
+                sample_fps=parsed_args.sample_fps,
+                log_level=log_level,
+                log_file=log_file,
+            )
+
+            # Ensure output directory exists
+            output_dir = os.path.dirname(parsed_args.output)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            # Write JSON output
+            with open(parsed_args.output, "w") as f:
+                f.write(analysis.to_json(indent=2))
+
+            print(f"✅ Analysis completed: {parsed_args.output}")
+            print(f"   {len(analysis.keyframes)} keyframes, {len(analysis.crop_windows)} dense samples")
+            print(f"   Mode: {analysis.mode}, Camera: {analysis.camera_mode}")
+            return 0
+
     except Exception as e:
         print(f"❌ Error: {str(e)}", file=sys.stderr)
         return 1

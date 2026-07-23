@@ -10,7 +10,14 @@ __version__ = "0.2.1"
 import logging
 from typing import Optional, Union
 
-from pyautoflip.core.processor import AutoFlipProcessor
+from pyautoflip.core.processor import (
+    AutoFlipProcessor,
+    CropAnalysis,
+    CropKeyframe,
+    CropWindow,
+    CropRegion,
+    SceneInfo,
+)
 
 # Configure root logger
 root_logger = logging.getLogger()
@@ -75,7 +82,7 @@ def reframe_video(
     motion_threshold: float = 0.5,
     padding_method: str = "blur",
     debug_mode: bool = False,
-    detection_method: str = "detection",
+    detection_method: str = "saliency",
     log_level: Union[int, str] = "INFO",
     log_file: Optional[str] = None,
 ) -> str:
@@ -111,4 +118,51 @@ def reframe_video(
     return processor.process_video(
         input_path=input_path,
         output_path=output_path,
+    )
+
+
+def analyze_video(
+    input_path: str,
+    target_aspect_ratio: str = "9:16",
+    motion_threshold: float = 0.5,
+    detection_method: str = "saliency",
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    sample_fps: float = 5.0,
+    log_level: Union[int, str] = "INFO",
+    log_file: Optional[str] = None,
+) -> "CropAnalysis":
+    """
+    Analyze a video and return crop window data without producing output video.
+
+    This is the "dry run" mode for getting crop proposals that can be
+    previewed client-side and optionally edited before extraction.
+
+    Args:
+        input_path: Path to the input video file
+        target_aspect_ratio: Target aspect ratio as "width:height" (e.g., "9:16")
+        motion_threshold: Threshold for camera motion (0.0-1.0)
+        detection_method: "detection" or "saliency"
+        start_time: Optional start time in seconds
+        end_time: Optional end time in seconds
+        sample_fps: FPS for dense crop window sampling (default 5.0)
+        log_level: Logging level
+        log_file: Optional log file path
+
+    Returns:
+        CropAnalysis dataclass with crop window data
+    """
+    configure_logging(log_level, log_file)
+
+    processor = AutoFlipProcessor(
+        target_aspect_ratio=target_aspect_ratio,
+        motion_threshold=motion_threshold,
+        detection_method=detection_method,
+    )
+
+    return processor.analyze_video(
+        input_path=input_path,
+        start_time=start_time,
+        end_time=end_time,
+        sample_fps=sample_fps,
     )
