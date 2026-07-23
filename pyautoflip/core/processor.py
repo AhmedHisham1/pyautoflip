@@ -813,9 +813,7 @@ class AutoFlipProcessor:
         )
 
         # Step 6: Sample dense windows at the requested fps
-        dense_windows = self._sample_dense_windows(
-            all_rel_windows, fps, sample_fps, start_time or 0.0
-        )
+        dense_windows = self._sample_dense_windows(all_rel_windows, fps, sample_fps)
 
         video_reader.cap.release()
 
@@ -1107,9 +1105,12 @@ class AutoFlipProcessor:
         all_rel_windows: List,
         source_fps: float,
         target_fps: float,
-        base_time: float,
     ) -> List[CropWindow]:
-        """Downsample per-frame multi-region windows to target FPS."""
+        """Downsample per-frame multi-region windows to target FPS.
+
+        All times are segment-relative (0-based), matching keyframe times.
+        Consumers apply the windows to the trimmed segment, never the source.
+        """
         if not all_rel_windows:
             return []
 
@@ -1120,7 +1121,7 @@ class AutoFlipProcessor:
         for frame_idx in range(0, total_frames, frame_step):
             regions = self._tuples_to_regions(all_rel_windows[frame_idx])
             windows.append(CropWindow(
-                time=base_time + frame_idx / source_fps,
+                time=frame_idx / source_fps,
                 regions=regions,
             ))
         return windows
