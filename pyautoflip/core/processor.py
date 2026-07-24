@@ -11,7 +11,6 @@ import os
 
 from pyautoflip.detection.shot_boundary import ShotBoundaryDetector
 from pyautoflip.detection.face_detector import FaceDetector
-from pyautoflip.detection.mediapipe_object_detector import ObjectDetector
 from pyautoflip.cropping.scene_cropper import SceneCropper
 from pyautoflip.cropping.saliency_cropper import SaliencyCropper
 from pyautoflip.utils.video import VideoReader, VideoWriter
@@ -164,6 +163,10 @@ class AutoFlipProcessor:
         self.shot_detector = ShotBoundaryDetector()
 
         if detection_method == "detection":
+            # Lazy import: mediapipe has no linux/arm64 wheels, and only
+            # detection mode needs it (saliency mode never touches it)
+            from pyautoflip.detection.mediapipe_object_detector import ObjectDetector
+
             self.face_detector = FaceDetector()
             self.object_detector = ObjectDetector()
         # Saliency cropper is initialized lazily per scene
