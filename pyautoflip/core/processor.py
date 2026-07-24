@@ -995,26 +995,27 @@ class AutoFlipProcessor:
             target_ar_tuple = saliency_cropper._aspect_ratio_to_tuple()
 
             # Build per-sample split info: sample_idx -> face centers or None
+            # Panel geometry mirrors render_split_screen_from_centers: each
+            # panel is a face-centered box (both axes) whose width equals the
+            # full-target-AR crop width and whose aspect is panel_ratio
+            # (target_w : target_h/2, e.g. 9:8) — the shape that fills half of
+            # the stacked output exactly, no padding.
+            target_ratio = target_ar_tuple[0] / target_ar_tuple[1]           # e.g. 9/16
+            panel_ratio = target_ar_tuple[0] / (target_ar_tuple[1] / 2.0)    # e.g. 9/8
+            crop_w_px = min(sh * target_ratio, sw)
+            crop_h_px = min(crop_w_px / panel_ratio, sh)
+            panel_crop_w = crop_w_px / sw
+            panel_crop_h = crop_h_px / sh
+
             per_sample_split = {}
             for si, faces in enumerate(all_faces):
                 split_result = find_split_faces(faces, sw, sh, target_ar_tuple)
                 if split_result is not None:
-                    # Convert face centers to crop regions (relative coords on small frame)
-                    # Each panel gets half the target AR height
-                    panel_ar = target_ar_tuple[0] / (target_ar_tuple[1] / 2)  # e.g. 9/8
-                    panel_w_rel = min(1.0, sh * panel_ar / sw / sw * sw)  # approximate
-                    # Simpler: compute panel crop width in normalized coords
-                    panel_crop_w = min(1.0, (sh / 2) * (target_ar_tuple[0] / target_ar_tuple[1]) / sw)
-                    panel_crop_h = min(1.0, (sh / 2) / sh)  # not needed, panel crops full height
-
                     regions = []
                     for cx_norm, cy_norm in split_result:
-                        # Region centered on face, width = panel_crop_w, full height
                         rx = max(0.0, min(cx_norm - panel_crop_w / 2, 1.0 - panel_crop_w))
-                        ry = 0.0
-                        rw = panel_crop_w
-                        rh = 1.0
-                        regions.append((rx, ry, rw, rh))
+                        ry = max(0.0, min(cy_norm - panel_crop_h / 2, 1.0 - panel_crop_h))
+                        regions.append((rx, ry, panel_crop_w, panel_crop_h))
                     per_sample_split[si] = regions
 
             # Map sample indices to frame indices for split info propagation
