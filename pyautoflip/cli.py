@@ -113,8 +113,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     analyze_parser.add_argument(
         "--method",
         choices=["detection", "saliency"],
-        default="detection",
-        help="Detection method. Default is 'detection'.",
+        default="saliency",
+        help="Detection method. Default is 'saliency' (matches the API and worker defaults).",
     )
     analyze_parser.add_argument(
         "-d",
