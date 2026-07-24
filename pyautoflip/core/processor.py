@@ -771,7 +771,11 @@ class AutoFlipProcessor:
         scene_boundaries = [(0, analysis_frame_count)]
         if analysis_frame_count / fps >= 30:
             try:
-                raw_boundaries = self.shot_detector.detect(input_path)
+                # Scan only the analyzed range — a full-file scan of a long
+                # source used to dominate analysis time for short segments
+                raw_boundaries = self.shot_detector.detect(
+                    input_path, start_frame=start_frame, end_frame=end_frame
+                )
                 # Filter to our range and adjust to relative indices
                 filtered = []
                 for b in raw_boundaries:

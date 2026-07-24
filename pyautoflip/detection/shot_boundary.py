@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from scenedetect import detect, ContentDetector
 
@@ -23,29 +23,40 @@ class ShotBoundaryDetector:
         self.threshold = threshold
         self.min_scene_length = min_scene_length
 
-    def detect(self, video_path: str) -> List[int]:
+    def detect(
+        self,
+        video_path: str,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+    ) -> List[int]:
         """
         Detect shot boundaries directly from a video file using SceneDetect.
 
         Args:
             video_path: Path to the video file
+            start_frame: Only scan from this frame (absolute) onward
+            end_frame: Stop scanning at this frame (absolute)
 
         Returns:
-            List of frame indices where shot boundaries occur
+            List of absolute frame indices where shot boundaries occur.
+            Scanning a subrange decodes only that range — analyzing a short
+            segment of a long video costs seconds instead of minutes.
         """
+        kwargs = {}
+        if start_frame is not None:
+            kwargs["start_time"] = int(start_frame)
+        if end_frame is not None:
+            kwargs["end_time"] = int(end_frame)
+
         # Use the new non-deprecated API for reduced memory usage
         scene_list = detect(
             video_path,
             ContentDetector(
                 threshold=self.threshold, min_scene_len=self.min_scene_length
             ),
+            **kwargs,
         )
 
-        # Convert scene list to boundary frames
-        shot_boundaries = []
-        for scene in scene_list:
-            # Start frame of each scene (except the first one) is a boundary
-            if scene[0].frame_num > 0:  # Skip the first scene's start (which is 0)
-                shot_boundaries.append(scene[0].frame_num)
-
-        return shot_boundaries
+        # Scene starts are boundaries — except the first scene's, which is
+        # just where the scan began (frame 0, or start_frame for subranges)
+        return [scene[0].frame_num for scene in scene_list[1:]]
