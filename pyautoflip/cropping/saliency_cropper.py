@@ -6,12 +6,13 @@ optimal crop windows. Supports split-screen for multi-face scenes.
 """
 
 import logging
-from typing import List, Dict, Tuple, Any, Optional
+from fractions import Fraction
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
 
-from pyautoflip.cropping.camera_motion import CameraMotionHandler
+from pyautoflip.cropping.camera_path import plan_camera_path, sample_indices_for_scene
 
 logger = logging.getLogger("autoflip.cropping.saliency_cropper")
 
@@ -24,16 +25,16 @@ class SaliencyCropper:
     """
     Coordinates saliency-based video scene cropping.
 
-    Pipeline per scene:
+    Pipeline per scene (on frames sampled at `analysis_fps`):
     1. Compute saliency maps (UNISAL) on downscaled frames
     2. Detect faces (InsightFace) with size filtering
     3. Build composite saliency (saliency + face regions)
-    4. Extract bbox + center of mass per frame
+    4. Extract bbox + center of mass per sample
     5. Determine per-scene crop width (narrow or wide)
-    6. Compute fixed-width crop windows centered on CoM
-    7. Stabilize with CameraMotionHandler (STATIONARY/PANNING/TRACKING)
-    8. Apply padding when crop is wider than target AR
-    9. Split-screen fallback when faces can't fit in one crop
+    6. Plan the camera path through the sampled centres (camera_path):
+       fixed when the subject barely moves, otherwise a smoothed track
+    7. Apply padding when crop is wider than target AR
+    8. Split-screen when faces can't share one crop for most of the scene
     """
 
     def __init__(
@@ -41,22 +42,33 @@ class SaliencyCropper:
         target_aspect_ratio: float,
         motion_threshold: float = 0.5,
         padding_method: str = "blur",
-        max_frames_per_scene: int = 5,
+        analysis_fps: float = 3.0,
+        max_samples_per_scene: int = 300,
         min_face_fraction: float = 0.03,
     ):
         self.target_aspect_ratio = target_aspect_ratio
+        # Kept for API compatibility; the camera path works in seconds instead
         self.motion_threshold = motion_threshold
         self.padding_method = padding_method
-        self.max_frames_per_scene = max_frames_per_scene
+        self.analysis_fps = analysis_fps
+        self.max_samples_per_scene = max_samples_per_scene
         self.min_face_fraction = min_face_fraction
 
-        self.camera_motion_handler = CameraMotionHandler(
-            motion_threshold=motion_threshold, smoothing_window=30
-        )
+        # Results of the last process_scene call
+        self._split_faces = None
+        self.last_faces = []
+        self.last_small_size = (0, 0)
+        self.last_camera_mode = "STATIONARY"
 
         # Lazy-loaded detectors
         self._saliency_detector = None
         self._face_detector = None
+
+    def sample_indices(self, scene_length: int, fps: float) -> List[int]:
+        """Scene-relative frames to analyze for a scene of `scene_length` frames."""
+        return sample_indices_for_scene(
+            scene_length, fps, self.analysis_fps, self.max_samples_per_scene
+        )
 
     @property
     def saliency_detector(self):
@@ -78,65 +90,60 @@ class SaliencyCropper:
         self,
         frames: List[np.ndarray],
         frame_count: int,
+        sample_indices: Optional[List[int]] = None,
+        fps: float = 30.0,
     ) -> List[Tuple[float, float, float, float]]:
         """
         Process a scene's sampled frames and return relative crop windows
-        for all frames in the scene.
+        for every frame in the scene.
 
         Args:
-            frames: Sampled key frames (BGR, full resolution)
+            frames: Sampled frames (BGR, full resolution)
             frame_count: Total number of frames in the scene
+            sample_indices: Scene-relative frame index of each sampled frame
+                (ascending); defaults to evenly spaced across the scene
+            fps: Frame rate, for time-based smoothing
 
         Returns:
-            List of (x_rel, y_rel, w_rel, h_rel) crop windows for all frames
+            List of (x_rel, y_rel, w_rel, h_rel) crop windows for all frames.
+            Afterwards `last_faces` / `last_small_size` hold the per-sample
+            face boxes (processing resolution) and `last_camera_mode` the
+            camera behaviour chosen for the scene.
         """
         if not frames:
             return []
-
-        frame_h, frame_w = frames[0].shape[:2]
+        if sample_indices is None:
+            sample_indices = [
+                int(i) for i in np.linspace(0, max(frame_count - 1, 0), len(frames))
+            ]
+        if len(sample_indices) != len(frames):
+            raise ValueError(f"{len(frames)} frames but {len(sample_indices)} sample indices")
 
         # Downscale for processing
         small_frames = self._downscale_frames(frames)
         sh, sw = small_frames[0].shape[:2]
 
-        # Step 1: Compute saliency maps
+        # Saliency maps + size-filtered faces -> bbox and centre of mass per sample
         saliency_maps = self._compute_saliency_maps(small_frames)
-
-        # Step 2: Detect faces (size-filtered)
         all_faces = self._detect_faces(small_frames)
+        raw_bboxes, raw_coms = self._compute_saliency_data(saliency_maps, all_faces, sh, sw)
 
-        # Step 3: Composite saliency + faces → bbox + CoM per frame
-        raw_bboxes, raw_coms = self._compute_saliency_data(
-            saliency_maps, all_faces, sh, sw
-        )
-
-        # Step 4: Per-scene crop width
+        # Per-scene crop width, then a camera path through the sampled centres
         target_aspect_tuple = self._aspect_ratio_to_tuple()
         crop_w = compute_scene_crop_width(raw_bboxes, sw, sh, target_aspect_tuple)
-
-        # Step 5: Raw crop windows (on small frame coords)
-        raw_crops = [
-            compute_crop_window(com, sw, sh, crop_w) for com in raw_coms
-        ]
-
-        # Step 6: Stabilize with CameraMotionHandler
-        smoothed_crops = self._stabilize_crops(raw_crops)
-
-        # Step 7: Interpolate to all frames and convert to relative coords
-        key_indices = list(range(len(smoothed_crops)))
-        interpolated = self.camera_motion_handler.interpolate_crop_windows(
-            [(c, 1.0) for c in smoothed_crops], key_indices, frame_count,
-            self.camera_motion_handler.select_camera_motion_mode(
-                [(c, 1.0) for c in smoothed_crops]
-            )
+        lefts, self.last_camera_mode = plan_camera_path(
+            centers=[com[0] * sw for com in raw_coms],
+            sample_indices=sample_indices,
+            frame_count=frame_count,
+            fps=fps,
+            crop_w=crop_w,
+            frame_w=sw,
         )
+        rel_windows = [(x / sw, 0.0, crop_w / sw, 1.0) for x in lefts]
 
-        # Convert to relative coordinates (normalized 0-1)
-        rel_windows = []
-        for x, y, w, h in interpolated:
-            rel_windows.append((x / sw, y / sh, w / sw, h / sh))
-
-        # Check for split-screen need (on small frame coords)
+        self.last_faces = all_faces
+        self.last_small_size = (sw, sh)
+        # Scene-level split-screen decision (used by the reframe path)
         self._split_faces = self._check_split_screen(all_faces, sw, sh, target_aspect_tuple)
 
         return rel_windows
@@ -187,16 +194,7 @@ class SaliencyCropper:
         if self._split_faces is None:
             return None
 
-        frame_h, frame_w = frame.shape[:2]
         target_tuple = self._aspect_ratio_to_tuple()
-
-        # Scale face centers from normalized to pixel coords
-        face_rects_px = []
-        for cx_n, cy_n in self._split_faces:
-            # Create approximate face rects from centers for render_split_screen
-            # The render function only needs centers, but find_split_faces returns them
-            pass
-
         return render_split_screen_from_centers(
             frame, self._split_faces, target_tuple
         )
@@ -204,19 +202,12 @@ class SaliencyCropper:
     # ─── Internal Methods ─────────────────────────────────────────────────
 
     def _aspect_ratio_to_tuple(self):
-        """Convert float aspect ratio to (w, h) integer tuple."""
-        # Common ratios
-        ratio_map = {
-            0.5625: (9, 16),
-            1.0: (1, 1),
-            0.75: (3, 4),
-            1.7778: (16, 9),
-        }
-        for r, t in ratio_map.items():
-            if abs(self.target_aspect_ratio - r) < 0.01:
-                return t
-        # Fallback: approximate
-        return (int(self.target_aspect_ratio * 16), 16)
+        """The float aspect ratio as an exact (w, h) integer tuple.
+
+        4:5 stays 4:5 (a lookup table used to fall back to 12:16, i.e. 3:4).
+        """
+        ratio = Fraction(self.target_aspect_ratio).limit_denominator(100)
+        return (ratio.numerator, ratio.denominator)
 
     def _downscale_frames(self, frames):
         """Downscale frames to processing width."""
@@ -284,30 +275,17 @@ class SaliencyCropper:
             coms.append(com)
         return bboxes, coms
 
-    def _stabilize_crops(self, raw_crops):
-        """Apply camera motion stabilization."""
-        if len(raw_crops) <= 1:
-            return raw_crops
-
-        scene_windows = [(c, 1.0) for c in raw_crops]
-        mode = self.camera_motion_handler.select_camera_motion_mode(scene_windows)
-
-        key_indices = list(range(len(raw_crops)))
-        interpolated = self.camera_motion_handler.interpolate_crop_windows(
-            scene_windows, key_indices, len(raw_crops), mode
-        )
-        smoothed = self.camera_motion_handler.smooth_trajectory(interpolated, mode)
-
-        logger.debug(f"Scene stabilization: {mode.name}")
-        return smoothed
-
     def _check_split_screen(self, all_faces, frame_w, frame_h, target_aspect):
-        """Check if any frame in the scene has faces too far apart for one crop."""
-        for faces in all_faces:
-            result = find_split_faces(faces, frame_w, frame_h, target_aspect)
-            if result is not None:
-                return result
-        return None
+        """Split-screen for the whole scene when most samples have faces too
+        far apart for one crop. Returns the median face centres of those
+        samples, or None — a single stray sample no longer splits a scene."""
+        splits = [find_split_faces(faces, frame_w, frame_h, target_aspect) for faces in all_faces]
+        hits = [s for s in splits if s is not None]
+        if not hits or len(hits) * 2 < len(splits):
+            return None
+        left = tuple(float(v) for v in np.median([h[0] for h in hits], axis=0))
+        right = tuple(float(v) for v in np.median([h[1] for h in hits], axis=0))
+        return [left, right]
 
 
 # ─── Standalone Functions ─────────────────────────────────────────────────────
@@ -357,14 +335,6 @@ def saliency_to_bbox(composite_mask):
     y_max = sorted_ys[np.searchsorted(cum_wy, cum_wy[-1] * 0.90)] / h
 
     return (x_min, y_min, x_max - x_min, y_max - y_min), (cx, cy)
-
-
-def compute_crop_window(center_of_mass, frame_w, frame_h, crop_w):
-    """Compute a fixed-width crop window centered on the CoM."""
-    cx_px = center_of_mass[0] * frame_w
-    crop_x = int(cx_px - crop_w / 2)
-    crop_x = max(0, min(crop_x, frame_w - crop_w))
-    return (crop_x, 0, crop_w, frame_h)
 
 
 def _make_even(n):

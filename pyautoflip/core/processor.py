@@ -292,13 +292,6 @@ class AutoFlipProcessor:
         logger.debug("Detecting scene boundaries...")
         start_time = time.time()
 
-        # skip scene detection for short videos (<30 seconds at 30fps)
-        duration_seconds = frame_count / 30  # assume 30fps
-        if duration_seconds < 30:
-            logger.debug(f"Video is short ({duration_seconds:.1f}s), skipping scene detection")
-            self.timing_info["shot_detection"] = time.time() - start_time
-            return [(0, frame_count)]
-
         try:
             shot_boundaries = self.shot_detector.detect(input_path)
 
@@ -419,6 +412,42 @@ class AutoFlipProcessor:
 
         return total_frames_processed
 
+    def _read_samples(
+        self, video_reader: VideoReader, abs_start: int, sample_indices: List[int]
+    ) -> Tuple[List[np.ndarray], List[int]]:
+        """Read the frames at abs_start + each sample index.
+
+        Dense samples are read in one sequential pass (grab() skips the frames
+        in between without converting them); sparse ones by seeking, which
+        decodes from the previous keyframe each time. Returns the frames and
+        the indices actually read.
+        """
+        cap = video_reader.cap
+        frames, read_indices = [], []
+        if not sample_indices:
+            return frames, read_indices
+        span = sample_indices[-1] - sample_indices[0] + 1
+        if span / len(sample_indices) <= 60:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, abs_start + sample_indices[0])
+            wanted = set(sample_indices)
+            for idx in range(sample_indices[0], sample_indices[-1] + 1):
+                if idx in wanted:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frames.append(frame)
+                    read_indices.append(idx)
+                elif not cap.grab():
+                    break
+        else:
+            for idx in sample_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, abs_start + idx)
+                ret, frame = cap.read()
+                if ret:
+                    frames.append(frame)
+                    read_indices.append(idx)
+        return frames, read_indices
+
     def _process_scenes_saliency(
         self,
         scene_boundaries: List[Tuple[int, int]],
@@ -445,25 +474,20 @@ class AutoFlipProcessor:
         ):
             scene_length = end_frame - start_frame
 
-            # Sample key frames for this scene
+            # Sample frames for this scene (by rate, capped per scene)
             detection_start = time.time()
-            n_samples = min(scene_length, saliency_cropper.max_frames_per_scene)
-            sample_indices = sorted(
-                [int(i) for i in np.linspace(0, scene_length - 1, max(2, n_samples))]
+            key_frames, sample_indices = self._read_samples(
+                video_reader, start_frame,
+                saliency_cropper.sample_indices(scene_length, video_reader.fps),
             )
-
-            key_frames = []
-            for idx in sample_indices:
-                video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + idx)
-                ret, frame = video_reader.cap.read()
-                if ret:
-                    key_frames.append(frame)
 
             if not key_frames:
                 continue
 
             # Process scene to get crop windows
-            rel_crop_windows = saliency_cropper.process_scene(key_frames, scene_length)
+            rel_crop_windows = saliency_cropper.process_scene(
+                key_frames, scene_length, sample_indices, video_reader.fps
+            )
             detection_time = time.time() - detection_start
             total_detection_time += detection_time
 
@@ -770,10 +794,10 @@ class AutoFlipProcessor:
             f"({start_frame}-{end_frame}, {analysis_frame_count/fps:.1f}s)"
         )
 
-        # Step 2: Detect scene boundaries within the range
-        # For short segments (<30s) we treat as single scene, which is typical for clips
+        # Step 2: Detect scene boundaries within the range — always: a cut
+        # inside a short clip still needs the crop to jump with it
         scene_boundaries = [(0, analysis_frame_count)]
-        if analysis_frame_count / fps >= 30:
+        if analysis_frame_count > 1:
             try:
                 # Scan only the analyzed range — a full-file scan of a long
                 # source used to dominate analysis time for short segments
@@ -821,7 +845,9 @@ class AutoFlipProcessor:
         )
 
         # Step 6: Sample dense windows at the requested fps
-        dense_windows = self._sample_dense_windows(all_rel_windows, fps, sample_fps)
+        dense_windows, dense_fps = self._sample_dense_windows(
+            all_rel_windows, fps, sample_fps, [start for start, _ in scene_boundaries]
+        )
 
         video_reader.cap.release()
 
@@ -837,7 +863,7 @@ class AutoFlipProcessor:
             mode=mode,
             keyframes=keyframes,
             crop_windows=dense_windows,
-            crop_windows_fps=sample_fps,
+            crop_windows_fps=dense_fps,
             camera_mode=dominant_camera_mode,
             is_talking_head=is_talking_head,
             scenes=scene_infos,
@@ -947,112 +973,74 @@ class AutoFlipProcessor:
         scene_boundaries: List[Tuple[int, int]],
         global_start_frame: int,
         total_analysis_frames: int,
-    ) -> Tuple[List, List[SceneInfo], str, bool]:
-        """Analyze scenes using saliency pipeline.
+    ) -> Tuple[List, List[SceneInfo], str, bool, str]:
+        """Analyze scenes using the saliency pipeline.
 
         Returns per-frame multi-region windows:
           all_rel_windows[i] = [(x,y,w,h)] for single-region frames
           all_rel_windows[i] = [(x1,y1,w1,h1), (x2,y2,w2,h2)] for split-screen frames
         """
+        from collections import Counter
+        from pyautoflip.cropping.camera_path import stable_states
         from pyautoflip.cropping.saliency_cropper import find_split_faces
 
+        fps = video_reader.fps or 30.0
         all_rel_windows = [None] * total_analysis_frames
         scene_infos = []
+        camera_modes = []
+        total_samples = 0
+        single_face_samples = 0
 
         saliency_cropper = SaliencyCropper(
             target_aspect_ratio=self.target_aspect_ratio,
             motion_threshold=self.motion_threshold,
             padding_method=self.padding_method,
         )
+        target_ar_tuple = saliency_cropper._aspect_ratio_to_tuple()
+        # A layout change (full <-> stacked) must hold ~1 s of samples to stick
+        min_layout_run = max(1, int(round(saliency_cropper.analysis_fps)))
 
-        for scene_idx, (scene_start, scene_end) in enumerate(scene_boundaries):
+        for scene_start, scene_end in scene_boundaries:
             scene_length = scene_end - scene_start
             abs_start = global_start_frame + scene_start
 
-            # Sample key frames
-            n_samples = min(scene_length, saliency_cropper.max_frames_per_scene)
-            sample_indices = sorted(
-                [int(i) for i in np.linspace(0, scene_length - 1, max(2, n_samples))]
+            key_frames, sample_indices = self._read_samples(
+                video_reader, abs_start, saliency_cropper.sample_indices(scene_length, fps)
             )
-
-            key_frames = []
-            for idx in sample_indices:
-                video_reader.cap.set(cv2.CAP_PROP_POS_FRAMES, abs_start + idx)
-                ret, frame = video_reader.cap.read()
-                if ret:
-                    key_frames.append(frame)
-
             if not key_frames:
-                fallback = [(0.25, 0.0, 0.5, 1.0)]
                 for i in range(scene_start, scene_end):
-                    all_rel_windows[i] = fallback
+                    all_rel_windows[i] = [(0.25, 0.0, 0.5, 1.0)]
                 scene_infos.append(SceneInfo(scene_start, scene_end, "STATIONARY"))
                 continue
 
-            # Get single-region crop windows from saliency
-            rel_crop_windows = saliency_cropper.process_scene(key_frames, scene_length)
+            # Single-region crop windows for every frame of the scene
+            rel_crop_windows = saliency_cropper.process_scene(
+                key_frames, scene_length, sample_indices, fps
+            )
+            camera_modes.append(saliency_cropper.last_camera_mode)
+            scene_infos.append(SceneInfo(scene_start, scene_end, saliency_cropper.last_camera_mode))
 
-            # Also detect per-sampled-frame split faces for stacked regions
-            small_frames = saliency_cropper._downscale_frames(key_frames)
-            sh, sw = small_frames[0].shape[:2]
-            all_faces = saliency_cropper._detect_faces(small_frames)
-            target_ar_tuple = saliency_cropper._aspect_ratio_to_tuple()
+            # Stacked regions from the faces process_scene already found:
+            # per-sample decision, debounced so a stray sample can't flip it
+            all_faces = saliency_cropper.last_faces
+            sw, sh = saliency_cropper.last_small_size
+            total_samples += len(all_faces)
+            single_face_samples += sum(1 for faces in all_faces if len(faces) == 1)
+            splits = [find_split_faces(faces, sw, sh, target_ar_tuple) for faces in all_faces]
+            split_on = stable_states([s is not None for s in splits], min_layout_run)
+            panel_regions = self._stacked_panel_regions(splits, split_on, sw, sh, target_ar_tuple)
 
-            # Build per-sample split info: sample_idx -> face centers or None
-            # Panel geometry mirrors render_split_screen_from_centers: each
-            # panel is a face-centered box (both axes) whose width equals the
-            # full-target-AR crop width and whose aspect is panel_ratio
-            # (target_w : target_h/2, e.g. 9:8) — the shape that fills half of
-            # the stacked output exactly, no padding.
-            target_ratio = target_ar_tuple[0] / target_ar_tuple[1]           # e.g. 9/16
-            panel_ratio = target_ar_tuple[0] / (target_ar_tuple[1] / 2.0)    # e.g. 9/8
-            crop_w_px = min(sh * target_ratio, sw)
-            crop_h_px = min(crop_w_px / panel_ratio, sh)
-            panel_crop_w = crop_w_px / sw
-            panel_crop_h = crop_h_px / sh
-
-            per_sample_split = {}
-            for si, faces in enumerate(all_faces):
-                split_result = find_split_faces(faces, sw, sh, target_ar_tuple)
-                if split_result is not None:
-                    regions = []
-                    for cx_norm, cy_norm in split_result:
-                        rx = max(0.0, min(cx_norm - panel_crop_w / 2, 1.0 - panel_crop_w))
-                        ry = max(0.0, min(cy_norm - panel_crop_h / 2, 1.0 - panel_crop_h))
-                        regions.append((rx, ry, panel_crop_w, panel_crop_h))
-                    per_sample_split[si] = regions
-
-            # Map sample indices to frame indices for split info propagation
-            # For frames between samples, inherit the nearest sample's split state
-            split_for_frame = [None] * scene_length
-            if per_sample_split:
-                for fi in range(scene_length):
-                    # Find nearest sample
-                    best_si = 0
-                    best_dist = abs(fi - sample_indices[0]) if sample_indices else float('inf')
-                    for si_idx, si_frame in enumerate(sample_indices):
-                        d = abs(fi - si_frame)
-                        if d < best_dist:
-                            best_dist = d
-                            best_si = si_idx
-                    split_for_frame[fi] = per_sample_split.get(best_si)
-
-            # Combine: single-region windows + per-frame split detection
-            if rel_crop_windows and len(rel_crop_windows) == scene_length:
-                for i in range(scene_length):
-                    single = rel_crop_windows[i]
-                    split = split_for_frame[i]
-                    if split and len(split) == 2:
-                        all_rel_windows[scene_start + i] = [split[0], split[1]]
-                    else:
-                        all_rel_windows[scene_start + i] = [single]
-            else:
-                fallback = [(rel_crop_windows[-1] if rel_crop_windows else (0.25, 0.0, 0.5, 1.0))]
-                for i in range(scene_start, scene_end):
-                    if all_rel_windows[i] is None:
-                        all_rel_windows[i] = fallback
-
-            scene_infos.append(SceneInfo(scene_start, scene_end, "TRACKING"))
+            # Every frame takes the layout of its nearest sample
+            samples = np.asarray(sample_indices)
+            frame_idx = np.arange(scene_length)
+            after = np.clip(np.searchsorted(samples, frame_idx), 0, len(samples) - 1)
+            before = np.clip(after - 1, 0, len(samples) - 1)
+            nearest = np.where(
+                np.abs(frame_idx - samples[before]) <= np.abs(samples[after] - frame_idx), before, after
+            )
+            for i in range(scene_length):
+                stacked = panel_regions[int(nearest[i])]
+                all_rel_windows[scene_start + i] = stacked if stacked else [rel_crop_windows[i]]
 
         # Fill gaps
         last_valid = [(0.25, 0.0, 0.5, 1.0)]
@@ -1062,11 +1050,46 @@ class AutoFlipProcessor:
             else:
                 all_rel_windows[i] = last_valid
 
-        # Determine dominant mode
+        # Dominant layout and camera behaviour
         stacked_count = sum(1 for w in all_rel_windows if w and len(w) > 1)
         mode = "stacked" if stacked_count > len(all_rel_windows) / 2 else "full"
+        dominant = Counter(camera_modes).most_common(1)[0][0] if camera_modes else "STATIONARY"
+        is_talking_head = total_samples > 0 and single_face_samples >= 0.7 * total_samples
 
-        return all_rel_windows, scene_infos, "TRACKING", False, mode
+        return all_rel_windows, scene_infos, dominant, is_talking_head, mode
+
+    @staticmethod
+    def _stacked_panel_regions(splits, split_on, frame_w, frame_h, target_ar_tuple):
+        """Per-sample stacked regions (or None) for one scene.
+
+        Panel geometry mirrors render_split_screen_from_centers: each panel is
+        a face-centred box as wide as the full-output crop, shaped like half
+        the output (e.g. 9:8 for 9:16) so it fills its half exactly. Face
+        centres are median-smoothed over neighbouring samples.
+        """
+        target_ratio = target_ar_tuple[0] / target_ar_tuple[1]
+        panel_ratio = target_ar_tuple[0] / (target_ar_tuple[1] / 2.0)
+        crop_w_px = min(frame_h * target_ratio, frame_w)
+        crop_h_px = min(crop_w_px / panel_ratio, frame_h)
+        panel_w, panel_h = crop_w_px / frame_w, crop_h_px / frame_h
+
+        regions = [None] * len(splits)
+        for si, on in enumerate(split_on):
+            if not on:
+                continue
+            nearby = [s for s in splits[max(0, si - 2):si + 3] if s is not None]
+            if not nearby:
+                continue
+            regions[si] = []
+            for k in (0, 1):
+                cx, cy = (float(v) for v in np.median([s[k] for s in nearby], axis=0))
+                regions[si].append((
+                    max(0.0, min(cx - panel_w / 2, 1.0 - panel_w)),
+                    max(0.0, min(cy - panel_h / 2, 1.0 - panel_h)),
+                    panel_w,
+                    panel_h,
+                ))
+        return regions
 
     @staticmethod
     def _tuples_to_regions(region_list):
@@ -1122,26 +1145,36 @@ class AutoFlipProcessor:
         all_rel_windows: List,
         source_fps: float,
         target_fps: float,
-    ) -> List[CropWindow]:
-        """Downsample per-frame multi-region windows to target FPS.
+        scene_starts: Optional[List[int]] = None,
+    ) -> Tuple[List[CropWindow], float]:
+        """Downsample per-frame multi-region windows to about target_fps.
 
         All times are segment-relative (0-based), matching keyframe times.
         Consumers apply the windows to the trimmed segment, never the source.
+        At every scene cut both the cut frame and the frame before it are
+        included, so interpolating consumers switch crops within one frame
+        instead of sliding across the cut.
+
+        Returns (windows, actual sampling rate).
         """
         if not all_rel_windows:
-            return []
+            return [], target_fps
 
         total_frames = len(all_rel_windows)
-        frame_step = max(1, int(source_fps / target_fps))
+        frame_step = max(1, int(round(source_fps / target_fps)))
+        indices = set(range(0, total_frames, frame_step))
+        for start in scene_starts or []:
+            if 0 < start < total_frames:
+                indices.update((start - 1, start))
 
-        windows = []
-        for frame_idx in range(0, total_frames, frame_step):
-            regions = self._tuples_to_regions(all_rel_windows[frame_idx])
-            windows.append(CropWindow(
-                time=round(frame_idx / source_fps, 3),
-                regions=regions,
-            ))
-        return windows
+        windows = [
+            CropWindow(
+                time=round(idx / source_fps, 3),
+                regions=self._tuples_to_regions(all_rel_windows[idx]),
+            )
+            for idx in sorted(indices)
+        ]
+        return windows, source_fps / frame_step
 
     def _log_processing_summary(self, total_start_time, total_frames_processed):
         """Log the processing summary statistics."""
