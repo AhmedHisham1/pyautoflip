@@ -342,10 +342,14 @@ def _make_even(n):
     return n - (n % 2)
 
 
-def compute_scene_crop_width(scene_bboxes, frame_w, frame_h, target_aspect):
+def compute_scene_crop_width(scene_bboxes, frame_w, frame_h, target_aspect, wide_share=0.5):
     """
     Compute fixed crop width for a scene (always even).
-    Narrow (exact AR) when saliency fits, wide (+30%) when it doesn't.
+
+    Narrow (exact AR) unless the salient area is wider than that in more than
+    `wide_share` of the scene's samples; then wide (+30%, padded to the target
+    AR on output). Deciding by majority keeps one wide sample from
+    letterboxing a whole scene.
     """
     aspect_w, aspect_h = target_aspect
     narrow_w = _make_even(int(frame_h * aspect_w / aspect_h))
@@ -354,8 +358,8 @@ def compute_scene_crop_width(scene_bboxes, frame_w, frame_h, target_aspect):
     if not scene_bboxes:
         return min(narrow_w, frame_w)
 
-    max_sal_w = max(bbox[2] * frame_w for bbox in scene_bboxes)
-    return min(narrow_w, frame_w) if max_sal_w <= narrow_w else wide_w
+    wide_samples = sum(1 for bbox in scene_bboxes if bbox[2] * frame_w > narrow_w)
+    return wide_w if wide_samples > wide_share * len(scene_bboxes) else min(narrow_w, frame_w)
 
 
 def apply_padding_to_crop(frame_bgr, crop, target_aspect, method="blur"):
