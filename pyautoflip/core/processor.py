@@ -1013,20 +1013,28 @@ class AutoFlipProcessor:
                 scene_infos.append(SceneInfo(scene_start, scene_end, "STATIONARY"))
                 continue
 
-            # Single-region crop windows for every frame of the scene
+            # Single-region crop windows for every frame of the scene. With
+            # several faces on screen the cropper reads extra frames to see
+            # who is talking, and leans the crop toward them
             rel_crop_windows = saliency_cropper.process_scene(
-                key_frames, scene_length, sample_indices, fps
+                key_frames, scene_length, sample_indices, fps,
+                read_frames=lambda indices, start=abs_start: self._read_samples(video_reader, start, indices),
             )
             camera_modes.append(saliency_cropper.last_camera_mode)
             scene_infos.append(SceneInfo(scene_start, scene_end, saliency_cropper.last_camera_mode))
 
             # Stacked regions from the faces process_scene already found:
-            # per-sample decision, debounced so a stray sample can't flip it
+            # per-sample decision, debounced so a stray sample can't flip it.
+            # With 3+ faces the pair is the two most active (when measured)
             all_faces = saliency_cropper.last_faces
+            activity = saliency_cropper.last_face_activity
             sw, sh = saliency_cropper.last_small_size
             total_samples += len(all_faces)
             single_face_samples += sum(1 for faces in all_faces if len(faces) == 1)
-            splits = [find_split_faces(faces, sw, sh, target_ar_tuple) for faces in all_faces]
+            splits = [
+                find_split_faces(faces, sw, sh, target_ar_tuple, activity[i] if activity else None)
+                for i, faces in enumerate(all_faces)
+            ]
             split_on = stable_states([s is not None for s in splits], min_layout_run)
             panel_regions = self._stacked_panel_regions(splits, split_on, sw, sh, target_ar_tuple)
 
@@ -1065,8 +1073,11 @@ class AutoFlipProcessor:
         Panel geometry mirrors render_split_screen_from_centers: each panel is
         a face-centred box as wide as the full-output crop, shaped like half
         the output (e.g. 9:8 for 9:16) so it fills its half exactly. Face
-        centres are median-smoothed over neighbouring samples.
+        centres are median-smoothed over neighbouring samples, and sit a
+        third of the way down their panel (headroom), not in its middle.
         """
+        from pyautoflip.cropping.saliency_cropper import STACKED_HEADROOM
+
         target_ratio = target_ar_tuple[0] / target_ar_tuple[1]
         panel_ratio = target_ar_tuple[0] / (target_ar_tuple[1] / 2.0)
         crop_w_px = min(frame_h * target_ratio, frame_w)
@@ -1085,7 +1096,7 @@ class AutoFlipProcessor:
                 cx, cy = (float(v) for v in np.median([s[k] for s in nearby], axis=0))
                 regions[si].append((
                     max(0.0, min(cx - panel_w / 2, 1.0 - panel_w)),
-                    max(0.0, min(cy - panel_h / 2, 1.0 - panel_h)),
+                    max(0.0, min(cy - panel_h * STACKED_HEADROOM, 1.0 - panel_h)),
                     panel_w,
                     panel_h,
                 ))

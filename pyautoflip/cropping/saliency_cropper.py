@@ -2,23 +2,28 @@
 Saliency-based scene cropper for video reframing.
 
 Uses UNISAL saliency maps + InsightFace face detection to determine
-optimal crop windows. Supports split-screen for multi-face scenes.
+optimal crop windows. Supports split-screen for multi-face scenes, and leans
+the crop toward whoever is talking (cropping/speakers.py).
 """
 
 import logging
+import math
 from fractions import Fraction
-from typing import List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional
 
 import cv2
 import numpy as np
 
+from pyautoflip.cropping import speakers
 from pyautoflip.cropping.camera_path import plan_camera_path, sample_indices_for_scene
 
 logger = logging.getLogger("autoflip.cropping.saliency_cropper")
 
-FACE_WEIGHT = 2.0       # Saliency boost for face regions
+FACE_WEIGHT = 2.0       # Saliency boost for face regions (the speaker's, once known)
+LISTENER_WEIGHT = 1.0   # Boost for the other faces while someone is talking
 WIDE_CROP_FACTOR = 1.30  # 30% wider crop when saliency exceeds 9:16 strip
 PROCESSING_WIDTH = 640    # Downscale width for saliency/face processing
+STACKED_HEADROOM = 1 / 3  # stacked panels put each face this far down from the panel top
 
 
 class SaliencyCropper:
@@ -27,14 +32,17 @@ class SaliencyCropper:
 
     Pipeline per scene (on frames sampled at `analysis_fps`):
     1. Compute saliency maps (UNISAL) on downscaled frames
-    2. Detect faces (InsightFace) with size filtering
-    3. Build composite saliency (saliency + face regions)
-    4. Extract bbox + center of mass per sample
-    5. Determine per-scene crop width (narrow or wide)
-    6. Plan the camera path through the sampled centres (camera_path):
+    2. Detect faces (InsightFace) with size filtering, linked into tracks
+    3. With several faces on screen (and a way to read more frames), measure
+       each track's mouth motion and find who is talking (speakers.py)
+    4. Build composite saliency (saliency + face regions; the speaker's face
+       weighs more than the listeners')
+    5. Extract bbox + center of mass per sample
+    6. Determine per-scene crop width (narrow or wide)
+    7. Plan the camera path through the sampled centres (camera_path):
        fixed when the subject barely moves, otherwise a smoothed track
-    7. Apply padding when crop is wider than target AR
-    8. Split-screen when faces can't share one crop for most of the scene
+    8. Apply padding when crop is wider than target AR
+    9. Split-screen when faces can't share one crop for most of the scene
     """
 
     def __init__(
@@ -59,6 +67,12 @@ class SaliencyCropper:
         self.last_faces = []
         self.last_small_size = (0, 0)
         self.last_camera_mode = "STATIONARY"
+        self.last_track_ids = []
+        # Set only when the speaker pass ran: the talking track per sample, and
+        # per-sample face priorities for split-screen pairing (aligned with
+        # last_faces; None where nobody clearly speaks)
+        self.last_face_activity = None
+        self.last_active_tracks = None
 
         # Lazy-loaded detectors
         self._saliency_detector = None
@@ -92,6 +106,7 @@ class SaliencyCropper:
         frame_count: int,
         sample_indices: Optional[List[int]] = None,
         fps: float = 30.0,
+        read_frames: Optional[Callable[[List[int]], Tuple[List[np.ndarray], List[int]]]] = None,
     ) -> List[Tuple[float, float, float, float]]:
         """
         Process a scene's sampled frames and return relative crop windows
@@ -103,12 +118,17 @@ class SaliencyCropper:
             sample_indices: Scene-relative frame index of each sampled frame
                 (ascending); defaults to evenly spaced across the scene
             fps: Frame rate, for time-based smoothing
+            read_frames: Optional callable(scene-relative indices) returning
+                (frames, indices read). When given and several faces share the
+                screen, extra frames are read to measure who is talking, and
+                the crop leans toward them. Without it every face weighs the same.
 
         Returns:
             List of (x_rel, y_rel, w_rel, h_rel) crop windows for all frames.
             Afterwards `last_faces` / `last_small_size` hold the per-sample
-            face boxes (processing resolution) and `last_camera_mode` the
-            camera behaviour chosen for the scene.
+            face boxes (processing resolution), `last_track_ids` their tracks,
+            `last_camera_mode` the camera behaviour chosen for the scene, and
+            (after a speaker pass) `last_face_activity` / `last_active_tracks`.
         """
         if not frames:
             return []
@@ -123,10 +143,21 @@ class SaliencyCropper:
         small_frames = self._downscale_frames(frames)
         sh, sw = small_frames[0].shape[:2]
 
-        # Saliency maps + size-filtered faces -> bbox and centre of mass per sample
+        # Saliency maps + size-filtered faces (with mouth openness), in tracks
         saliency_maps = self._compute_saliency_maps(small_frames)
-        all_faces = self._detect_faces(small_frames)
-        raw_bboxes, raw_coms = self._compute_saliency_data(saliency_maps, all_faces, sh, sw)
+        all_faces, all_mouths = self._detect_faces(small_frames)
+        self.last_faces = all_faces
+        self.last_small_size = (sw, sh)
+        self.last_track_ids = speakers.build_tracks(all_faces)
+        self.last_face_activity = None
+        self.last_active_tracks = None
+
+        face_weights = None
+        if read_frames is not None and self._wants_speaker_pass(all_faces, all_mouths):
+            face_weights = self._speaker_pass(all_mouths, sample_indices, frame_count, fps, read_frames)
+
+        # Bbox and centre of mass per sample
+        raw_bboxes, raw_coms = self._compute_saliency_data(saliency_maps, all_faces, sh, sw, face_weights)
 
         # Per-scene crop width, then a camera path through the sampled centres
         target_aspect_tuple = self._aspect_ratio_to_tuple()
@@ -141,10 +172,10 @@ class SaliencyCropper:
         )
         rel_windows = [(x / sw, 0.0, crop_w / sw, 1.0) for x in lefts]
 
-        self.last_faces = all_faces
-        self.last_small_size = (sw, sh)
         # Scene-level split-screen decision (used by the reframe path)
-        self._split_faces = self._check_split_screen(all_faces, sw, sh, target_aspect_tuple)
+        self._split_faces = self._check_split_screen(
+            all_faces, sw, sh, target_aspect_tuple, self.last_face_activity
+        )
 
         return rel_windows
 
@@ -236,8 +267,12 @@ class SaliencyCropper:
         return maps
 
     def _detect_faces(self, frames):
-        """Detect faces on each frame with size filtering."""
-        all_faces = []
+        """Detect faces on each frame with size filtering.
+
+        Returns (boxes, mouths): per frame, the kept faces' (x, y, w, h) boxes
+        and each one's mouth openness (None without landmarks).
+        """
+        all_faces, all_mouths = [], []
         for frame in frames:
             h, w = frame.shape[:2]
             frame_area = h * w
@@ -249,37 +284,115 @@ class SaliencyCropper:
                 fy = int(d["y"] * h)
                 fw = int(d["width"] * w)
                 fh = int(d["height"] * h)
-                candidates.append((fx, fy, fw, fh, fw * fh))
+                candidates.append((fx, fy, fw, fh, fw * fh, d.get("mouth_open")))
 
             if not candidates:
                 all_faces.append([])
+                all_mouths.append([])
                 continue
 
             max_area = max(c[4] for c in candidates)
-            rects = []
-            for fx, fy, fw, fh, area in candidates:
+            rects, mouths = [], []
+            for fx, fy, fw, fh, area, mouth in candidates:
                 if area < frame_area * self.min_face_fraction and area < max_area * 0.3:
                     continue
                 rects.append((fx, fy, fw, fh))
+                mouths.append(mouth)
             all_faces.append(rects)
+            all_mouths.append(mouths)
 
-        return all_faces
+        return all_faces, all_mouths
 
-    def _compute_saliency_data(self, saliency_maps, all_faces, h, w):
+    def _wants_speaker_pass(self, all_faces, all_mouths) -> bool:
+        """Whether who is talking should steer the scene's crop: several faces
+        on screen together for a while, with mouth measurements available."""
+        together = sum(1 for faces in all_faces if len(faces) >= 2)
+        measured = any(m is not None for mouths in all_mouths for m in mouths)
+        return measured and together >= max(2, speakers.HOLD_S * self.analysis_fps)
+
+    def _speaker_sample_indices(self, sample_indices, frame_count, fps) -> List[int]:
+        """Extra scene-relative frames to read for mouth motion: about
+        SPEAKER_FPS around the stretch where several faces were seen, minus
+        the frames already sampled."""
+        together = [sample_indices[i] for i, faces in enumerate(self.last_faces) if len(faces) >= 2]
+        if not together:
+            return []
+        step = max(1, int(round((fps or 30.0) / speakers.SPEAKER_FPS)))
+        lo = max(0, together[0] - 3 * step)
+        hi = min(frame_count - 1, together[-1] + 3 * step)
+        taken = set(sample_indices)
+        return [i for i in range(lo, hi + 1, step) if i not in taken]
+
+    def _speaker_pass(self, all_mouths, sample_indices, frame_count, fps, read_frames):
+        """Find who is talking; returns per-sample face weights for the composite.
+
+        Mouth openness per track comes from the sampled detections plus extra
+        frames read at about SPEAKER_FPS, where only the landmark model runs,
+        on the track's interpolated box. Sets last_face_activity and
+        last_active_tracks.
+        """
+        spans = speakers.track_spans(self.last_faces, self.last_track_ids, sample_indices)
+        series = {tid: ([], []) for tid in spans}
+        for index, ids, mouths in zip(sample_indices, self.last_track_ids, all_mouths):
+            for tid, mouth in zip(ids, mouths):
+                if mouth is not None:
+                    series[tid][0].append(index)
+                    series[tid][1].append(mouth)
+
+        extra = self._speaker_sample_indices(sample_indices, frame_count, fps)
+        extra_frames, extra_indices = read_frames(extra) if extra else ([], [])
+        reach = max(1.0, (fps or 30.0) / self.analysis_fps / 2)
+        for frame, index in zip(self._downscale_frames(extra_frames), extra_indices):
+            live = [
+                (tid, box) for tid, span in spans.items()
+                if (box := speakers.box_at(span, index, reach)) is not None
+            ]
+            if not live:
+                continue
+            mouths = self.face_detector.mouth_openness_at(frame, [box for _, box in live])
+            for (tid, _), mouth in zip(live, mouths):
+                if mouth is not None:
+                    series[tid][0].append(index)
+                    series[tid][1].append(mouth)
+
+        activity = speakers.track_activity(series, sample_indices, fps)
+        hold = max(1, math.ceil(speakers.HOLD_S * self.analysis_fps))
+        active = speakers.active_track_per_sample(activity, len(sample_indices), hold)
+
+        self.last_active_tracks = active
+        # Pairing for split screens (find_split_faces): where someone is
+        # clearly talking, the speaker first, then the most active other face;
+        # elsewhere None, so the outermost faces pair up as without a pass
+        # (activity there is mostly head motion)
+        self.last_face_activity = [
+            [math.inf if tid == active[si] else float(np.nan_to_num(activity[tid][si])) for tid in ids]
+            if active[si] is not None else None
+            for si, ids in enumerate(self.last_track_ids)
+        ]
+        return [
+            [FACE_WEIGHT if active[si] is None or tid == active[si] else LISTENER_WEIGHT for tid in ids]
+            for si, ids in enumerate(self.last_track_ids)
+        ]
+
+    def _compute_saliency_data(self, saliency_maps, all_faces, h, w, face_weights=None):
         """Compute composite saliency → bbox + CoM for each frame."""
         bboxes, coms = [], []
         for i in range(len(saliency_maps)):
-            composite = get_composite_mask(saliency_maps[i], all_faces[i])
+            weights = face_weights[i] if face_weights else None
+            composite = get_composite_mask(saliency_maps[i], all_faces[i], weights)
             bbox, com = saliency_to_bbox(composite)
             bboxes.append(bbox)
             coms.append(com)
         return bboxes, coms
 
-    def _check_split_screen(self, all_faces, frame_w, frame_h, target_aspect):
+    def _check_split_screen(self, all_faces, frame_w, frame_h, target_aspect, activity=None):
         """Split-screen for the whole scene when most samples have faces too
         far apart for one crop. Returns the median face centres of those
         samples, or None — a single stray sample no longer splits a scene."""
-        splits = [find_split_faces(faces, frame_w, frame_h, target_aspect) for faces in all_faces]
+        splits = [
+            find_split_faces(faces, frame_w, frame_h, target_aspect, activity[i] if activity else None)
+            for i, faces in enumerate(all_faces)
+        ]
         hits = [s for s in splits if s is not None]
         if not hits or len(hits) * 2 < len(splits):
             return None
@@ -291,14 +404,18 @@ class SaliencyCropper:
 # ─── Standalone Functions ─────────────────────────────────────────────────────
 
 
-def get_composite_mask(saliency_map, face_rects=None):
-    """Combine saliency map with face detection regions."""
+def get_composite_mask(saliency_map, face_rects=None, face_weights=None):
+    """Combine saliency map with face detection regions.
+
+    Each face's box is raised to at least its weight (FACE_WEIGHT unless
+    `face_weights` gives one per face).
+    """
     composite = saliency_map.copy()
-    if face_rects and len(face_rects) > 0:
-        for (fx, fy, fw, fh) in face_rects:
-            composite[fy:fy+fh, fx:fx+fw] = np.maximum(
-                composite[fy:fy+fh, fx:fx+fw], FACE_WEIGHT
-            )
+    for i, (fx, fy, fw, fh) in enumerate(face_rects or []):
+        weight = FACE_WEIGHT if face_weights is None else face_weights[i]
+        composite[fy:fy+fh, fx:fx+fw] = np.maximum(
+            composite[fy:fy+fh, fx:fx+fw], weight
+        )
     return composite
 
 
@@ -403,13 +520,19 @@ def apply_padding_to_crop(frame_bgr, crop, target_aspect, method="blur"):
     return canvas
 
 
-def find_split_faces(face_rects, frame_w, frame_h, target_aspect):
+def find_split_faces(face_rects, frame_w, frame_h, target_aspect, activity=None):
     """
     Check if 2+ faces are too far apart to fit in one crop.
     Returns [(cx, cy), (cx, cy)] normalized 0-1, or None.
+
+    With 3+ faces and per-face `activity` (speakers.py), the two most active
+    faces are the pair; otherwise the outermost two.
     """
     if not face_rects or len(face_rects) < 2:
         return None
+    if activity is not None and len(face_rects) > 2:
+        top_two = sorted(range(len(face_rects)), key=lambda i: activity[i] or 0.0, reverse=True)[:2]
+        face_rects = [face_rects[i] for i in sorted(top_two)]
 
     crop_w = int(frame_h * target_aspect[0] / target_aspect[1])
     crop_w_norm = crop_w / frame_w
