@@ -1,3 +1,4 @@
+import math
 import time
 import json
 import logging
@@ -1069,8 +1070,16 @@ class AutoFlipProcessor:
 
     @staticmethod
     def _tuples_to_regions(region_list):
-        """Convert a list of (x,y,w,h) tuples to CropRegion objects."""
-        return [CropRegion(x=t[0], y=t[1], w=t[2], h=t[3]) for t in region_list]
+        """Convert (x,y,w,h) tuples to CropRegion objects, 4 decimals each.
+
+        Full float precision nearly doubles the stored JSON for no visible
+        gain (1e-4 of a 1920 px frame is 0.2 px). Values are floored, so a
+        region never grows past the frame edge.
+        """
+        return [
+            CropRegion(*(math.floor(float(v) * 10_000) / 10_000 for v in t))
+            for t in region_list
+        ]
 
     def _extract_keyframes(
         self,
@@ -1103,7 +1112,7 @@ class AutoFlipProcessor:
             regions = self._tuples_to_regions(all_rel_windows[idx])
             keyframes.append(CropKeyframe(
                 frame=idx,
-                time=idx / fps,
+                time=round(idx / fps, 3),
                 regions=regions,
             ))
         return keyframes
@@ -1129,7 +1138,7 @@ class AutoFlipProcessor:
         for frame_idx in range(0, total_frames, frame_step):
             regions = self._tuples_to_regions(all_rel_windows[frame_idx])
             windows.append(CropWindow(
-                time=frame_idx / source_fps,
+                time=round(frame_idx / source_fps, 3),
                 regions=regions,
             ))
         return windows

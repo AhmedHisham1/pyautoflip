@@ -32,3 +32,15 @@ def test_regions_stay_inside_the_frame_at_the_target_aspect(make_clip):
         assert 0 <= r.y and r.y + r.h <= 1 + 1e-6
         # full-height 9:16 strip of a 16:9 frame
         assert (r.w * W) / (r.h * H) == pytest.approx(9 / 16, rel=0.02)
+
+
+def test_output_is_compact(make_clip):
+    """Stored per clip and sent to browsers: coords to 4 decimals, times to 3."""
+    analysis = _analyze(make_clip(seconds=2.0, fps=FPS, size=(W, H)))
+
+    for window in analysis.crop_windows + analysis.keyframes:
+        assert window.time == round(window.time, 3)
+        for r in window.regions:
+            for v in (r.x, r.y, r.w, r.h):
+                assert v == round(v, 4)
+            assert r.x + r.w <= 1.0
