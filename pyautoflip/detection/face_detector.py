@@ -6,6 +6,8 @@ import numpy as np
 from insightface.app import FaceAnalysis
 from insightface.app.common import Face
 
+from .onnx_device import on_gpu, onnx_providers
+
 logger = logging.getLogger("autoflip.detection.face_detector")
 
 # 2d106det layout: the 20 mouth points, corners at 52 and 61 (upper lip
@@ -56,14 +58,17 @@ class FaceDetector:
         """
         if cls._app is None:
             logger.info(f"Initializing InsightFace FaceAnalysis ({model_name}) for the first time...")
-            providers = ["CPUExecutionProvider"]
+            providers = list(onnx_providers())
             # Detection, plus 106-point landmarks for mouth motion (who is
             # talking); packs without the landmark model just skip it
             cls._app = FaceAnalysis(
                 name=model_name, providers=providers, allowed_modules=["detection", "landmark_2d_106"]
             )
-            cls._app.prepare(ctx_id=-1, det_size=(640, 640))
-            logger.info("FaceAnalysis model loaded successfully")
+            # A negative ctx_id puts every model back on the CPU
+            cls._app.prepare(ctx_id=0 if on_gpu() else -1, det_size=(640, 640))
+            detection = cls._app.models.get("detection")
+            device = detection.session.get_providers()[0] if detection is not None else providers[0]
+            logger.info(f"FaceAnalysis model loaded successfully on {device}")
         return cls._app
 
     def __init__(

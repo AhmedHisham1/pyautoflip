@@ -44,12 +44,16 @@ class SaliencyDetector:
                     "Please ensure unisal.onnx is in the detection directory."
                 )
             import onnxruntime as ort
+            from .onnx_device import onnx_providers
             start = time.time()
             cls._session = ort.InferenceSession(
                 str(_ONNX_MODEL_PATH),
-                providers=["CPUExecutionProvider"],
+                providers=list(onnx_providers()),
             )
-            logger.info(f"UNISAL ONNX model loaded in {time.time() - start:.2f}s")
+            logger.info(
+                f"UNISAL ONNX model loaded in {time.time() - start:.2f}s "
+                f"on {cls._session.get_providers()[0]}"
+            )
         return cls._session
 
     def __init__(self, model_type: str = "images"):
