@@ -107,6 +107,17 @@ class VideoReader:
                 pass
 
 
+# The encoders the final file is tried with, in order: NVENC where the box has it (a container needs
+# NVIDIA_DRIVER_CAPABILITIES=video), then libx264 at a fast preset. PYAUTOFLIP_FINAL_ENCODER=cpu skips NVENC;
+# PYAUTOFLIP_X264_PRESET sets the CPU preset (veryfast by default; the old default preset, medium, was 3x slower)
+def final_encoders():
+    preset = os.environ.get("PYAUTOFLIP_X264_PRESET", "veryfast")
+    cpu = ["-c:v", "libx264", "-preset", preset, "-crf", "18"]
+    if (os.environ.get("PYAUTOFLIP_FINAL_ENCODER") or "auto").strip().lower() == "cpu":
+        return [cpu]
+    return [["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20"], cpu]
+
+
 class VideoWriter:
     """
     Utility for writing video files.
@@ -284,27 +295,30 @@ class VideoWriter:
             frame_rate_str = probe_result.stdout.strip()
             logger.debug(f"Detected video frame rate: {frame_rate_str}")
 
-            # Use more accurate ffmpeg command for proper audio sync
-            cmd = [
-                "ffmpeg",
-                "-i", self.temp_path,  # Video input
-                "-i", self.audio_path,  # Audio input
-                "-c:v", "libx264",  # Use libx264 encoder (very widely supported)
-                "-crf", "18",      # Quality setting
-                # "-preset", "fast", # Speed/quality tradeoff
-                "-c:a", "aac",     # AAC audio codec
-                "-vsync", "1",     # Ensure video frames are preserved
-                "-map", "0:v:0",   # Use video from first input
-                "-map", "1:a:0",   # Use audio from second input
-                "-shortest",       # Match shortest input
-                "-y",              # Overwrite output file
-                self.output_path,
-            ]
-
-            # Run the command
-            result = subprocess.run(
-                cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
+            # Use more accurate ffmpeg command for proper audio sync. The written frames are re-encoded here
+            # (the OpenCV writer's mp4v is not for the web): with libx264 at its default preset this took 36
+            # minutes for a 27-minute video on a loaded 6-core box, silently, after the scenes were done
+            # (2026-10-21). The GPU encoder first where the box has one, the fast CPU preset otherwise
+            for encoder in final_encoders():
+                cmd = [
+                    "ffmpeg",
+                    "-i", self.temp_path,  # Video input
+                    "-i", self.audio_path,  # Audio input
+                    *encoder,
+                    "-c:a", "aac",     # AAC audio codec
+                    "-vsync", "1",     # Ensure video frames are preserved
+                    "-map", "0:v:0",   # Use video from first input
+                    "-map", "1:a:0",   # Use audio from second input
+                    "-shortest",       # Match shortest input
+                    "-y",              # Overwrite output file
+                    self.output_path,
+                ]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if result.returncode == 0:
+                    break
+                logger.info(f"Final encode with {encoder[1]} failed ({result.stderr.decode(errors='replace')[-200:]}); trying the next encoder")
+            else:
+                raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
             logger.debug("Audio/video combination complete")
 
             # Verify output duration matches original
