@@ -16,7 +16,7 @@ BG_BEFORE_CUT = (90, 30, 10)   # dark blue
 BG_AFTER_CUT = (20, 140, 230)  # orange
 
 
-def write_clip(path, *, seconds=3.0, fps=30, size=(640, 360), subject_x=None, cut_at=None, seed=0):
+def write_clip(path, *, seconds=3.0, fps=30, size=(640, 360), subject_x=None, cut_at=None, seed=0, cuts=()):
     """Write a synthetic clip and return its path.
 
     Args:
@@ -26,6 +26,7 @@ def write_clip(path, *, seconds=3.0, fps=30, size=(640, 360), subject_x=None, cu
         subject_x: callable t -> subject centre x in [0, 1]; default static 0.5
         cut_at: time (s) of a hard cut: the background colour switches there
         seed: noise seed (clips are deterministic)
+        cuts: times (s) of several hard cuts: the background switches colour at each
     """
     w, h = size
     rng = np.random.default_rng(seed)
@@ -34,6 +35,8 @@ def write_clip(path, *, seconds=3.0, fps=30, size=(640, 360), subject_x=None, cu
     for i in range(int(round(seconds * fps))):
         t = i / fps
         bg = BG_AFTER_CUT if cut_at is not None and t >= cut_at else BG_BEFORE_CUT
+        if cuts:
+            bg = (BG_BEFORE_CUT, BG_AFTER_CUT)[sum(1 for c in cuts if t >= c) % 2]
         frame = np.empty((h, w, 3), np.uint8)
         frame[:] = bg
         noise = rng.integers(0, 10, (h, w, 1), dtype=np.uint8)

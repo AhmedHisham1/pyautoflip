@@ -749,6 +749,7 @@ class AutoFlipProcessor:
         start_time: Optional[float] = None,
         end_time: Optional[float] = None,
         sample_fps: float = 5.0,
+        scene_workers: Optional[int] = None,
     ) -> CropAnalysis:
         """
         Analyze a video and return crop window data without producing output video.
@@ -762,6 +763,7 @@ class AutoFlipProcessor:
             start_time: Optional start time in seconds (analyze a subrange)
             end_time: Optional end time in seconds
             sample_fps: FPS for dense crop window sampling (default 5.0)
+            scene_workers: scenes analysed at once (saliency method); None or 1 one after the other
 
         Returns:
             CropAnalysis dataclass with all crop window data
@@ -829,7 +831,8 @@ class AutoFlipProcessor:
         if self.detection_method == "saliency":
             all_rel_windows, scene_infos, dominant_camera_mode, is_talking_head, mode = (
                 self._analyze_scenes_saliency(
-                    video_reader, scene_boundaries, start_frame, analysis_frame_count
+                    video_reader, scene_boundaries, start_frame, analysis_frame_count,
+                    scene_workers=scene_workers,
                 )
             )
         else:
@@ -973,62 +976,131 @@ class AutoFlipProcessor:
         scene_boundaries: List[Tuple[int, int]],
         global_start_frame: int,
         total_analysis_frames: int,
+        scene_workers: Optional[int] = None,
     ) -> Tuple[List, List[SceneInfo], str, bool, str]:
         """Analyze scenes using the saliency pipeline.
 
         Returns per-frame multi-region windows:
           all_rel_windows[i] = [(x,y,w,h)] for single-region frames
           all_rel_windows[i] = [(x1,y1,w1,h1), (x2,y2,w2,h2)] for split-screen frames
+
+        Each scene is analysed on its own (_analyze_one_scene) and the results are put together in scene order
+        (_assemble_saliency_scenes). With `scene_workers` above 1, that many scenes are analysed at once, each thread
+        with a reader of its own: the models are shared (an ONNX session runs calls from several threads at once),
+        and most of a scene's time is spent inside them, so scenes overlap. The result is the same either way.
         """
+        fps = video_reader.fps or 30.0
+        workers = min(int(scene_workers or 1), len(scene_boundaries))
+        if workers <= 1:
+            results = [
+                self._analyze_one_scene(video_reader, bounds, global_start_frame, fps)
+                for bounds in scene_boundaries
+            ]
+        else:
+            results = self._analyze_scenes_at_once(
+                video_reader.video_path, scene_boundaries, global_start_frame, fps, workers
+            )
+        return self._assemble_saliency_scenes(results, total_analysis_frames)
+
+    def _analyze_scenes_at_once(self, video_path, scene_boundaries, global_start_frame, fps, workers):
+        """_analyze_one_scene for every scene, `workers` at a time, in scene order."""
+        import threading
+        from pyautoflip.detection.saliency_detector import SaliencyDetector
+
+        # The shared models are made once, here, before the threads would race to make them
+        SaliencyDetector()
+        FaceDetector()
+        local = threading.local()
+        readers = []
+        lock = threading.Lock()
+
+        def one(bounds):
+            reader = getattr(local, "reader", None)
+            if reader is None:
+                reader = local.reader = VideoReader(video_path)
+                with lock:
+                    readers.append(reader)
+            return self._analyze_one_scene(reader, bounds, global_start_frame, fps)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(workers, thread_name_prefix="autoflip-scene") as pool:
+                return list(pool.map(one, scene_boundaries))
+        finally:
+            for reader in readers:
+                reader.cap.release()
+
+    def _new_saliency_cropper(self) -> SaliencyCropper:
+        return SaliencyCropper(
+            target_aspect_ratio=self.target_aspect_ratio,
+            motion_threshold=self.motion_threshold,
+            padding_method=self.padding_method,
+        )
+
+    def _analyze_one_scene(self, video_reader: VideoReader, bounds, global_start_frame: int, fps: float) -> dict:
+        """One scene's crop windows and what the assembly needs of it, with a cropper of its own (a cropper keeps
+        nothing from one scene to the next but the shared models). `rel_windows` is None when no frame was read."""
+        scene_start, scene_end = bounds
+        scene_length = scene_end - scene_start
+        abs_start = global_start_frame + scene_start
+        cropper = self._new_saliency_cropper()
+        key_frames, sample_indices = self._read_samples(
+            video_reader, abs_start, cropper.sample_indices(scene_length, fps)
+        )
+        if not key_frames:
+            return {"bounds": bounds, "rel_windows": None}
+        # Single-region crop windows for every frame of the scene. With
+        # several faces on screen the cropper reads extra frames to see
+        # who is talking, and leans the crop toward them
+        rel_windows = cropper.process_scene(
+            key_frames, scene_length, sample_indices, fps,
+            read_frames=lambda indices, start=abs_start: self._read_samples(video_reader, start, indices),
+        )
+        return {
+            "bounds": bounds,
+            "rel_windows": rel_windows,
+            "sample_indices": sample_indices,
+            "camera_mode": cropper.last_camera_mode,
+            "faces": cropper.last_faces,
+            "activity": cropper.last_face_activity,
+            "small_size": cropper.last_small_size,
+        }
+
+    def _assemble_saliency_scenes(self, results, total_analysis_frames: int):
+        """The per-frame windows, scene infos and the analysis's modes from each scene's result, in scene order."""
         from collections import Counter
         from pyautoflip.cropping.camera_path import stable_states
         from pyautoflip.cropping.saliency_cropper import find_split_faces
 
-        fps = video_reader.fps or 30.0
         all_rel_windows = [None] * total_analysis_frames
         scene_infos = []
         camera_modes = []
         total_samples = 0
         single_face_samples = 0
 
-        saliency_cropper = SaliencyCropper(
-            target_aspect_ratio=self.target_aspect_ratio,
-            motion_threshold=self.motion_threshold,
-            padding_method=self.padding_method,
-        )
-        target_ar_tuple = saliency_cropper._aspect_ratio_to_tuple()
+        reference = self._new_saliency_cropper()
+        target_ar_tuple = reference._aspect_ratio_to_tuple()
         # A layout change (full <-> stacked) must hold ~1 s of samples to stick
-        min_layout_run = max(1, int(round(saliency_cropper.analysis_fps)))
+        min_layout_run = max(1, int(round(reference.analysis_fps)))
 
-        for scene_start, scene_end in scene_boundaries:
+        for result in results:
+            scene_start, scene_end = result["bounds"]
             scene_length = scene_end - scene_start
-            abs_start = global_start_frame + scene_start
-
-            key_frames, sample_indices = self._read_samples(
-                video_reader, abs_start, saliency_cropper.sample_indices(scene_length, fps)
-            )
-            if not key_frames:
+            rel_crop_windows = result["rel_windows"]
+            if rel_crop_windows is None:
                 for i in range(scene_start, scene_end):
                     all_rel_windows[i] = [(0.25, 0.0, 0.5, 1.0)]
                 scene_infos.append(SceneInfo(scene_start, scene_end, "STATIONARY"))
                 continue
 
-            # Single-region crop windows for every frame of the scene. With
-            # several faces on screen the cropper reads extra frames to see
-            # who is talking, and leans the crop toward them
-            rel_crop_windows = saliency_cropper.process_scene(
-                key_frames, scene_length, sample_indices, fps,
-                read_frames=lambda indices, start=abs_start: self._read_samples(video_reader, start, indices),
-            )
-            camera_modes.append(saliency_cropper.last_camera_mode)
-            scene_infos.append(SceneInfo(scene_start, scene_end, saliency_cropper.last_camera_mode))
+            camera_modes.append(result["camera_mode"])
+            scene_infos.append(SceneInfo(scene_start, scene_end, result["camera_mode"]))
 
             # Stacked regions from the faces process_scene already found:
             # per-sample decision, debounced so a stray sample can't flip it.
             # With 3+ faces the pair is the two most active (when measured)
-            all_faces = saliency_cropper.last_faces
-            activity = saliency_cropper.last_face_activity
-            sw, sh = saliency_cropper.last_small_size
+            all_faces = result["faces"]
+            activity = result["activity"]
+            sw, sh = result["small_size"]
             total_samples += len(all_faces)
             single_face_samples += sum(1 for faces in all_faces if len(faces) == 1)
             splits = [
@@ -1039,7 +1111,7 @@ class AutoFlipProcessor:
             panel_regions = self._stacked_panel_regions(splits, split_on, sw, sh, target_ar_tuple)
 
             # Every frame takes the layout of its nearest sample
-            samples = np.asarray(sample_indices)
+            samples = np.asarray(result["sample_indices"])
             frame_idx = np.arange(scene_length)
             after = np.clip(np.searchsorted(samples, frame_idx), 0, len(samples) - 1)
             before = np.clip(after - 1, 0, len(samples) - 1)

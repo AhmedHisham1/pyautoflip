@@ -131,6 +131,7 @@ def analyze_video(
     sample_fps: float = 5.0,
     log_level: Union[int, str] = "INFO",
     log_file: Optional[str] = None,
+    scene_workers: Optional[int] = None,
 ) -> "CropAnalysis":
     """
     Analyze a video and return crop window data without producing output video.
@@ -146,6 +147,8 @@ def analyze_video(
         start_time: Optional start time in seconds
         end_time: Optional end time in seconds
         sample_fps: FPS for dense crop window sampling (default 5.0)
+        scene_workers: how many of the clip's scenes are analysed at once (threads sharing the models); None or 1
+            analyses them one after the other. The result is the same
         log_level: Logging level
         log_file: Optional log file path
 
@@ -165,4 +168,5 @@ def analyze_video(
         start_time=start_time,
         end_time=end_time,
         sample_fps=sample_fps,
+        scene_workers=scene_workers,
     )
